@@ -92,9 +92,9 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-    trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default, risky)
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 8192))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 112))
+    trigram_enabled = bool(int(os.environ.get("TRIGRAM", "1")))  # TrigramHash (on by default for EngramLite)
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on ALL layers (our novel contribution)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
@@ -115,6 +115,7 @@ class Hyperparameters:
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
+    gptq_mixed_precision = bool(int(os.environ.get("GPTQ_MIXED_PRECISION", "1")))  # Hessian-guided int5/int6/int7
     # Test-time training (TTT) — legal score-first recipe
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", 0.002))
@@ -838,6 +839,13 @@ class BigramHashEmbedding(nn.Module):
         self._trigram = trigram
         self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
         nn.init.zeros_(self.embed.weight)
+        # Separate trigram embedding table for richer representation
+        if trigram:
+            self.tri_embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+            nn.init.zeros_(self.tri_embed.weight)
+            self.gate = nn.Linear(bigram_dim * 2, 1, bias=True)
+            nn.init.zeros_(self.gate.weight)
+            nn.init.constant_(self.gate.bias, 1.0)  # start gate open
         self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
         if self.proj is not None:
             nn.init.zeros_(self.proj.weight)
@@ -858,9 +866,14 @@ class BigramHashEmbedding(nn.Module):
         out[..., 2:] = (36313 * t[..., 2:] ^ 27191 * t[..., 1:-1] ^ 51497 * t[..., :-2]) % mod
         return out.long()
     def forward(self, token_ids: Tensor) -> Tensor:
-        h = self.embed(self.bigram_hash(token_ids))
+        h_bi = self.embed(self.bigram_hash(token_ids))
         if self._trigram:
-            h = h + self.embed(self.trigram_hash(token_ids))
+            h_tri = self.tri_embed(self.trigram_hash(token_ids))
+            # Sigmoid gating to suppress noisy hash collisions
+            gate = torch.sigmoid(self.gate(torch.cat([h_bi, h_tri], dim=-1)))
+            h = h_bi + gate * h_tri
+        else:
+            h = h_bi
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
@@ -1932,12 +1945,58 @@ def collect_hessians(hessian_model, train_loader, args, device, grad_accum_steps
     hessian_model.train()
     return hessians
 
-def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hessians: dict[str, Tensor] | None = None):
+def _compute_hessian_sensitivity(hessians: dict[str, Tensor]) -> dict[str, float]:
+    """Compute per-layer sensitivity from Hessian diagonal trace.
+    Higher trace = more sensitive = needs more bits."""
+    sensitivity: dict[str, float] = {}
+    for name, H in hessians.items():
+        trace = torch.diag(H).abs().mean().item()
+        sensitivity[name] = trace
+    return sensitivity
+
+def _assign_bit_widths(sensitivity: dict[str, float], quantizable_names: list[str]) -> dict[str, int]:
+    """Assign int5/int6/int7 per layer based on Hessian sensitivity.
+    Top 20% most sensitive → int7 (clip=63), bottom 30% → int5 (clip=15), rest → int6 (clip=31)."""
+    if not quantizable_names:
+        return {}
+    scores = [(name, sensitivity.get(name, 0.0)) for name in quantizable_names]
+    scores.sort(key=lambda x: x[1])
+    n = len(scores)
+    # Bottom 30% → int5, middle 50% → int6, top 20% → int7
+    int5_cutoff = int(n * 0.30)
+    int7_cutoff = int(n * 0.80)
+    bit_map: dict[str, int] = {}
+    for i, (name, _) in enumerate(scores):
+        if i < int5_cutoff:
+            bit_map[name] = 5  # clip_range=15
+        elif i >= int7_cutoff:
+            bit_map[name] = 7  # clip_range=63
+        else:
+            bit_map[name] = 6  # clip_range=31
+    return bit_map
+
+_BITS_TO_CLIP = {5: 15, 6: 31, 7: 63}
+
+def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hessians: dict[str, Tensor] | None = None,
+                        mixed_precision: bool = False):
     num_layers_total = max(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,
     ) + 1
     late_k_layers = set(range(num_layers_total - 2, num_layers_total))
+    # Determine per-layer bit widths if mixed precision enabled
+    bit_map: dict[str, int] = {}
+    if mixed_precision and hessians:
+        quantizable_names = [
+            name for name, tensor in state_dict.items()
+            if _classify_param(name) in int6_cats
+            and tensor.is_floating_point()
+            and tensor.numel() > 65536
+            and tensor.ndim >= 1
+            and not any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS)
+        ]
+        sensitivity = _compute_hessian_sensitivity(hessians)
+        bit_map = _assign_bit_widths(sensitivity, quantizable_names)
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
@@ -1952,7 +2011,8 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hess
             meta[name] = "passthrough_ctrl"
             continue
         if cat in int6_cats and t.ndim >= 1:
-            cr = 31  # int6 for all weights
+            bits = bit_map.get(name, 6)
+            cr = _BITS_TO_CLIP.get(bits, 31)
             H = hessians.get(name) if hessians else None
             if H is not None:
                 q, s = quantize_int6_gptq(t, hessian=H, clip_range=cr)
@@ -1960,7 +2020,7 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hess
                 q, s = quantize_int6_per_row(t, clip_range=cr)
             result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": "int6"}
+            meta[name] = {"type": f"int{bits}"}
         else:
             q, s = quantize_float_tensor(t)
             result[name + ".q"] = q
@@ -2463,7 +2523,14 @@ def main() -> None:
     del ar_tokens
     del hessian_model
     torch.cuda.empty_cache()
-    quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn", "mamba"}, hessians=hessians)
+    quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn", "mamba"}, hessians=hessians,
+                                                    mixed_precision=args.gptq_mixed_precision)
+    # Log bit allocation summary
+    bit_counts: dict[str, int] = {}
+    for info in quant_meta.values():
+        if isinstance(info, dict):
+            bit_counts[info.get("type", "?")] = bit_counts.get(info.get("type", "?"), 0) + 1
+    log0(f"gptq:bit allocation: {bit_counts}")
     # NOVEL: Selective ±1 pruning by reconstruction error
     # Sort ±1 quantized values by their reconstruction error (scale²),
     # prune least-impactful first until artifact fits target size.
@@ -2471,7 +2538,7 @@ def main() -> None:
     code_bytes_est = len(code.encode("utf-8"))
     ones_info = []  # (tensor_key, flat_idx, error)
     for name, info in quant_meta.items():
-        if not (isinstance(info, dict) and info.get("type") == "int6"): continue
+        if not (isinstance(info, dict) and info.get("type", "").startswith("int") and info.get("type") != "int8"): continue
         qk, sk = name + ".q", name + ".scale"
         if qk not in quant_result or sk not in quant_result: continue
         q, s = quant_result[qk], quant_result[sk]
