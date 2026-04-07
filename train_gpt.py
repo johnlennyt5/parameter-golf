@@ -99,7 +99,7 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
-    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
+    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
@@ -2109,8 +2109,10 @@ def main() -> None:
         assert HAS_CAUSAL_CONV1D, "causal-conv1d required for Mamba layers — install causal-conv1d>=1.4.0"
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
-    torch._dynamo.config.cache_size_limit = 64
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
+    has_mamba = len(base_model.mamba_layer_set) > 0
+    if has_mamba:
+        torch._dynamo.config.cache_size_limit = 64
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=not has_mamba)
     model = compiled_model
 
     # Optimizer split:
@@ -2554,8 +2556,10 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    torch._dynamo.config.cache_size_limit = 64
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=False)
+    has_mamba_eval = hasattr(eval_model, 'mamba_layer_set') and len(eval_model.mamba_layer_set) > 0
+    if has_mamba_eval:
+        torch._dynamo.config.cache_size_limit = 64
+    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=not has_mamba_eval)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
