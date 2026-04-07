@@ -28,17 +28,6 @@ try:
     from flash_attn_interface import flash_attn_func as flash_attn_3_func
 except ImportError:
     from flash_attn import flash_attn_func as flash_attn_3_func
-# Optional Mamba CUDA kernels — fall back to sequential PyTorch if unavailable
-try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn as _mamba_selective_scan_fn
-    HAS_MAMBA_CUDA = True
-except ImportError:
-    HAS_MAMBA_CUDA = False
-try:
-    from causal_conv1d import causal_conv1d_fn as _causal_conv1d_fn
-    HAS_CAUSAL_CONV1D = True
-except ImportError:
-    HAS_CAUSAL_CONV1D = False
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -105,26 +94,10 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))  # VRL with sigmoid gates (off by default, risky)
-    # Mamba hybrid configuration
-    mamba_layers = os.environ.get("MAMBA_LAYERS", "")  # comma-separated layer indices, empty = pure attention
-    mamba_d_state = int(os.environ.get("MAMBA_D_STATE", 32))
-    mamba_d_conv = int(os.environ.get("MAMBA_D_CONV", 4))
-    mamba_expand = float(os.environ.get("MAMBA_EXPAND", 1.5))
-    mamba_matrix_lr = float(os.environ.get("MAMBA_MATRIX_LR", 0.015))
-    mamba_grad_checkpoint = bool(int(os.environ.get("MAMBA_GRAD_CHECKPOINT", "0")))  # gradient checkpointing for Mamba layers
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
     gptq_mixed_precision = bool(int(os.environ.get("GPTQ_MIXED_PRECISION", "1")))  # Hessian-guided int5/int6/int7
-    # Test-time training (TTT) — legal score-first recipe
-    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
-    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
-    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
-    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
-    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
-    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
-    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
-    ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -708,130 +681,6 @@ class SmearGate(nn.Module):
         x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
         return (1 - g) * x + g * x_prev
 
-class MambaBlock(nn.Module):
-    """Mamba-2 selective state-space block with sequential scan fallback."""
-    def __init__(self, d_model: int = 512, d_state: int = 32, d_conv: int = 4, expand: float = 1.5):
-        super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        d_inner = int(expand * d_model)
-        self.d_inner = d_inner
-        dt_rank = max(d_model // 16, 1)
-        self.dt_rank = dt_rank
-
-        # Input projection: x, z (gate), B, dt all in one matmul (CastedLinear for QAT)
-        self.in_proj = CastedLinear(d_model, d_inner * 2 + d_state + dt_rank, bias=False)
-
-        # Depthwise causal conv (applied to x branch only)
-        self.conv1d = nn.Conv1d(d_inner, d_inner, d_conv, padding=d_conv - 1, groups=d_inner)
-
-        # dt projection: dt_rank -> d_inner
-        self.dt_proj = nn.Linear(dt_rank, d_inner, bias=True)
-
-        # SSM parameters
-        self.A_log = nn.Parameter(torch.log(torch.arange(1, d_state + 1, dtype=torch.float32).unsqueeze(0).expand(d_inner, -1).clone()))
-        self.D = nn.Parameter(torch.ones(d_inner, dtype=torch.float32))
-
-        # C projection (from input to output mixing weights)
-        self.c_proj = nn.Linear(d_model, d_state, bias=False)
-
-        # Output projection (CastedLinear for QAT)
-        self.out_proj = CastedLinear(d_inner, d_model, bias=False)
-
-        self.norm = RMSNorm()
-
-        # Init: c_proj small normal for stable SSM output mixing
-        nn.init.normal_(self.c_proj.weight, std=0.01)
-        # Init: out_proj near-zero for clean residual at init
-        nn.init.normal_(self.out_proj.weight, std=0.01)
-        # Init: dt_proj bias for dt_init in [0.001, 0.1]
-        with torch.no_grad():
-            dt_init = torch.exp(torch.rand(d_inner) * (math.log(0.1) - math.log(0.001)) + math.log(0.001))
-            inv_softplus = torch.log(torch.exp(dt_init) - 1.0)
-            self.dt_proj.bias.copy_(inv_softplus)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """x: (B, L, D) -> (B, L, D)"""
-        residual = x
-        x = self.norm(x)
-
-        # Project input
-        proj = self.in_proj(x)  # (B, L, d_inner*2 + d_state + dt_rank)
-        x_in, z, B_ssm, dt_in = proj.split(
-            [self.d_inner, self.d_inner, self.d_state, self.dt_rank], dim=-1
-        )
-
-        A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
-
-        if HAS_MAMBA_CUDA and x.is_cuda:
-            # === CUDA fast path: fused kernels ===
-            x_in = x_in.transpose(1, 2).contiguous()  # (B, d_inner, L)
-            if HAS_CAUSAL_CONV1D:
-                # Fused causal conv1d + SiLU
-                conv_weight = self.conv1d.weight.squeeze(1)  # (d_inner, d_conv)
-                x_in = _causal_conv1d_fn(x=x_in, weight=conv_weight,
-                                         bias=self.conv1d.bias.to(conv_weight.dtype), activation="silu")
-            else:
-                x_in = self.conv1d(x_in)[:, :, :residual.size(1)]
-                x_in = F.silu(x_in)
-            # dt projection: (B, L, dt_rank) -> (B, d_inner, L) without bias (kernel handles bias)
-            dt_raw = F.linear(dt_in, self.dt_proj.weight)  # (B, L, d_inner)
-            dt_raw = dt_raw.transpose(1, 2).contiguous()   # (B, d_inner, L)
-            # Rearrange B, C to (B, d_state, L)
-            B_t = B_ssm.transpose(1, 2).contiguous()  # (B, d_state, L)
-            C = self.c_proj(x)  # (B, L, d_state) from normed input
-            C_t = C.transpose(1, 2).contiguous()  # (B, d_state, L)
-            z_t = z.transpose(1, 2).contiguous()  # (B, d_inner, L)
-            # CUDA selective scan: handles discretization, softplus, and gating
-            y = _mamba_selective_scan_fn(
-                x_in, dt_raw, A, B_t, C_t,
-                D=self.D.float(),
-                z=z_t,
-                delta_bias=self.dt_proj.bias.float(),
-                delta_softplus=True,
-            )  # (B, d_inner, L)
-            y = y.transpose(1, 2).to(dtype=residual.dtype)  # (B, L, d_inner), cast to match residual (bf16)
-        else:
-            # === Sequential fallback (CPU / no mamba-ssm) ===
-            x_in = x_in.transpose(1, 2)  # (B, d_inner, L)
-            x_in = self.conv1d(x_in)[:, :, :residual.size(1)]  # causal trim
-            x_in = x_in.transpose(1, 2)  # (B, L, d_inner)
-            x_in = F.silu(x_in)
-            C = self.c_proj(x)  # (B, L, d_state)
-            dt = F.softplus(self.dt_proj(dt_in))  # (B, L, d_inner)
-            dA = torch.exp(dt.unsqueeze(-1) * A)  # (B, L, d_inner, d_state)
-            dB = dt.unsqueeze(-1) * B_ssm.unsqueeze(2)  # (B, L, d_inner, d_state)
-            y = self._selective_scan(x_in, dA, dB, C, self.D)
-            y = y * F.silu(z)
-
-        y = self.out_proj(y)
-        return residual + y.to(residual.dtype)
-
-    @torch.compiler.disable
-    def _selective_scan(self, x: Tensor, dA: Tensor, dB: Tensor, C: Tensor, D: Tensor) -> Tensor:
-        """Sequential selective scan fallback.
-        h[t] = dA[t]*h[t-1] + dB[t]*x[t], y[t] = C[t]@h[t] + D*x[t]
-        Hidden state accumulated in float32 for numerical stability during bf16 training.
-        Decorated with @torch.compiler.disable so the Python loop doesn't break
-        fullgraph=True compilation (on GPU, the CUDA fast path is used instead).
-        """
-        B_batch, L, d_inner = x.shape
-        orig_dtype = x.dtype
-        # Accumulate hidden state in fp32 for stability
-        h = torch.zeros(B_batch, d_inner, self.d_state, device=x.device, dtype=torch.float32)
-        dA = dA.float()
-        dB = dB.float()
-        x_f = x.float()
-        C_f = C.float()
-        D_f = D.float()
-        ys = []
-        for t in range(L):
-            h = dA[:, t] * h + dB[:, t] * x_f[:, t, :, None]
-            y_t = (h * C_f[:, t, None, :]).sum(-1) + D_f * x_f[:, t]
-            ys.append(y_t)
-        return torch.stack(ys, dim=1).to(orig_dtype)
-
 class BigramHashEmbedding(nn.Module):
     def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int, trigram: bool = False):
         super().__init__()
@@ -972,10 +821,6 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
-        mamba_layers: str = "",
-        mamba_d_state: int = 32,
-        mamba_d_conv: int = 4,
-        mamba_expand: float = 1.5,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -994,33 +839,16 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        # --- Mamba/Attention hybrid dispatch ---
-        self.mamba_layer_set = set(int(x) for x in mamba_layers.split(",") if x.strip()) if mamba_layers else set()
-        n_mamba = len(self.mamba_layer_set)
-        n_attn = num_layers - n_mamba
-        # Build index maps: global layer idx -> local block idx
-        self.mamba_idx_map: dict[int, int] = {}
-        self.attn_idx_map: dict[int, int] = {}
-        mamba_counter = 0
-        attn_counter = 0
-        for i in range(num_layers):
-            if i in self.mamba_layer_set:
-                self.mamba_idx_map[i] = mamba_counter
-                mamba_counter += 1
-            else:
-                self.attn_idx_map[i] = attn_counter
-                attn_counter += 1
-        # Parameter banks: sized for attention layers only
+        # Parameter banks
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
         mlp_dim = int(mlp_mult * model_dim)
         self.num_layers = num_layers
-        self.n_attn = n_attn
-        self.qo_bank = nn.Parameter(torch.empty(2 * n_attn, model_dim, model_dim))
-        self.kv_bank = nn.Parameter(torch.empty(2 * n_attn, kv_dim, model_dim))
-        self.mlp_up_bank = nn.Parameter(torch.empty(n_attn, mlp_dim, model_dim))
-        self.mlp_down_bank = nn.Parameter(torch.empty(n_attn, model_dim, mlp_dim))
-        # Attention blocks (only for non-Mamba layers)
+        self.n_attn = num_layers
+        self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
+        self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
+        self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
+        self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -1036,14 +864,7 @@ class GPT(nn.Module):
                     gated_attention=gated_attention,
                     value_residual=value_residual,
                 )
-                for i in range(num_layers) if i not in self.mamba_layer_set
-            ]
-        )
-        # Mamba blocks
-        self.mamba_blocks = nn.ModuleList(
-            [
-                MambaBlock(d_model=model_dim, d_state=mamba_d_state, d_conv=mamba_d_conv, expand=mamba_expand)
-                for _ in range(n_mamba)
+                for i in range(num_layers)
             ]
         )
         if rope_dims > 0:
@@ -1072,11 +893,8 @@ class GPT(nn.Module):
         for head in self.mtp_heads:
             head._zero_init = True
         if xsa_last_n > 0:
-            for ai, block in enumerate(self.blocks):
-                # Find global layer index for this attention block
-                global_idx = [g for g, a in self.attn_idx_map.items() if a == ai][0]
-                if global_idx >= max(0, num_layers - xsa_last_n):
-                    block.attn.use_xsa = True
+            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+                self.blocks[i].attn.use_xsa = True
         self._init_weights()
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -1095,7 +913,6 @@ class GPT(nn.Module):
             self.qo_bank.data[n_attn + i].mul_(proj_scale)
             self.mlp_down_bank.data[i].mul_(proj_scale)
         # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
-        # Note: MambaBlock.__init__ handles its own init (out_proj near-zero, dt_proj bias)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
@@ -1113,24 +930,14 @@ class GPT(nn.Module):
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
     def _forward_layer(self, layer_idx: int, x: Tensor, x0: Tensor, input_ids: Tensor,
                         ve_cache: dict, v0: Tensor | None) -> tuple[Tensor, Tensor | None]:
-        """Dispatch a single layer: Mamba or Attention."""
-        if layer_idx in self.mamba_layer_set:
-            mi = self.mamba_idx_map[layer_idx]
-            if self.training and getattr(self, '_mamba_grad_checkpoint', False):
-                x = torch.utils.checkpoint.checkpoint(
-                    self.mamba_blocks[mi], x, use_reentrant=False)
-            else:
-                x = self.mamba_blocks[mi](x)
-            return x, None
-        else:
-            ai = self.attn_idx_map[layer_idx]
-            n_a = self.n_attn
-            ve = self._get_ve(layer_idx, input_ids, ve_cache)
-            x, raw_v = self.blocks[ai](x, x0,
-                self.qo_bank[ai], self.kv_bank[ai], self.kv_bank[n_a + ai],
-                self.qo_bank[n_a + ai], self.mlp_up_bank[ai], self.mlp_down_bank[ai],
-                v_embed=ve, v0=v0)
-            return x, raw_v
+        """Dispatch a single attention layer."""
+        n_a = self.n_attn
+        ve = self._get_ve(layer_idx, input_ids, ve_cache)
+        x, raw_v = self.blocks[layer_idx](x, x0,
+            self.qo_bank[layer_idx], self.kv_bank[layer_idx], self.kv_bank[n_a + layer_idx],
+            self.qo_bank[n_a + layer_idx], self.mlp_up_bank[layer_idx], self.mlp_down_bank[layer_idx],
+            v_embed=ve, v0=v0)
+        return x, raw_v
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1237,10 +1044,7 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    if hasattr(base_model, 'mamba_layer_set') and len(base_model.mamba_layer_set) > 0:
-        compiled_logits = base_model.forward_logits
-    else:
-        compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     with torch.inference_mode():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
@@ -1282,182 +1086,6 @@ def eval_val_sliding(
     tokens_per_byte = token_count.item() / byte_count.item()
     base_model.train()
     return val_loss, bits_per_token * tokens_per_byte
-
-
-# --- Legal score-first test-time training (TTT) ---
-
-def eval_val_sliding_ttt(
-    args: Hyperparameters,
-    base_model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    stride: int,
-    eval_seq_len: int | None = None,
-    log0=print,
-) -> tuple[float, float]:
-    """Legal score-first TTT: score each chunk with sliding windows,
-    then train on already-scored tokens. Every token is scored BEFORE
-    any weight update that could use it."""
-    seq_len = eval_seq_len or args.train_seq_len
-    total_tokens = val_tokens.numel() - 1
-    ttt_chunk = args.ttt_chunk_tokens
-    batch_seqs = args.ttt_batch_seqs
-
-    # Pre-compute all window starts
-    window_starts = [ws for ws in range(0, total_tokens, stride)
-                     if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0]
-
-    # Assign each window to a chunk based on the first token it scores
-    num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
-    chunk_windows: list[list[int]] = [[] for _ in range(num_chunks)]
-    for ws in window_starts:
-        end = min(ws + seq_len, total_tokens)
-        wlen = end - ws
-        s = 0 if ws == 0 else max(wlen - stride, 0)
-        scored_start = ws + s
-        ci = min(scored_start // ttt_chunk, num_chunks - 1)
-        chunk_windows[ci].append(ws)
-
-    log0(f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
-         f"total_windows={len(window_starts)} stride={stride} "
-         f"ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs} "
-         f"freeze_blocks={args.ttt_freeze_blocks}")
-
-    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    token_count = torch.zeros((), device=device, dtype=torch.float64)
-    byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    # Freeze first N blocks (Mamba or attention)
-    frozen_block_ids = set(range(min(args.ttt_freeze_blocks, args.num_layers)))
-    ttt_params = []
-    for name, p in base_model.named_parameters():
-        freeze = False
-        for bi in frozen_block_ids:
-            # Freeze both attention blocks and mamba_blocks with matching index
-            if f"blocks.{bi}." in name or f"mamba_blocks.{bi}." in name:
-                freeze = True
-                break
-        if freeze:
-            p.requires_grad_(False)
-        else:
-            p.requires_grad_(True)
-            ttt_params.append(p)
-
-    log0(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
-         f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
-
-    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
-    autocast_device = "cuda" if device.type == "cuda" else "cpu"
-    autocast_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    t0 = time.perf_counter()
-
-    for ci in range(num_chunks):
-        windows = chunk_windows[ci]
-        if not windows:
-            continue
-        chunk_start = ci * ttt_chunk
-        chunk_end = min((ci + 1) * ttt_chunk, total_tokens)
-
-        # --- Phase 1: SCORE this chunk's windows (no_grad) ---
-        # Use no_grad (not inference_mode) so cached tensors like RoPE cos/sin
-        # don't become inference-only and poison the TRAIN phase's autograd.
-        my_s = (len(windows) * rank) // world_size
-        my_e = (len(windows) * (rank + 1)) // world_size
-        my_windows = windows[my_s:my_e]
-
-        base_model.eval()
-        with torch.no_grad():
-            for bi in range(0, len(my_windows), batch_seqs):
-                batch_ws = my_windows[bi:bi + batch_seqs]
-                bsz = len(batch_ws)
-                x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-                y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-                wlens: list[int] = []
-                for i, ws in enumerate(batch_ws):
-                    end = min(ws + seq_len, total_tokens)
-                    wlen = end - ws
-                    wlens.append(wlen)
-                    chunk_tok = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
-                    x_batch[i, :wlen] = chunk_tok[:-1]
-                    y_batch[i, :wlen] = chunk_tok[1:]
-                with torch.autocast(device_type=autocast_device, dtype=autocast_dtype):
-                    logits = base_model.forward_logits(x_batch)
-                nll = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)).float(),
-                    y_batch.reshape(-1), reduction="none",
-                ).reshape(bsz, seq_len)
-                for i, ws in enumerate(batch_ws):
-                    wlen = wlens[i]
-                    s = 0 if ws == 0 else max(wlen - stride, 0)
-                    scored_nll = nll[i, s:wlen].to(torch.float64)
-                    loss_sum += scored_nll.sum()
-                    token_count += float(wlen - s)
-                    tgt, prev = y_batch[i, s:wlen], x_batch[i, s:wlen]
-                    tb = base_bytes_lut[tgt].to(torch.float64)
-                    tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-                    byte_count += tb.sum()
-
-        # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
-        is_last_chunk = (ci == num_chunks - 1)
-        if not is_last_chunk and args.ttt_epochs > 0:
-            base_model.train()
-            chunk_seqs = (chunk_end - chunk_start) // seq_len
-            if chunk_seqs > 0:
-                cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
-                for pg in optimizer.param_groups:
-                    pg['lr'] = cos_lr
-                my_seq_s = (chunk_seqs * rank) // world_size
-                my_seq_e = (chunk_seqs * (rank + 1)) // world_size
-                my_chunk_seqs = my_seq_e - my_seq_s
-                for _ep in range(args.ttt_epochs):
-                    for bs in range(0, my_chunk_seqs, batch_seqs):
-                        be = min(bs + batch_seqs, my_chunk_seqs)
-                        actual_bs = my_seq_s + bs
-                        start_tok = chunk_start + actual_bs * seq_len
-                        end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
-                        if end_tok > val_tokens.numel():
-                            continue
-                        local = val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
-                        x = local[:-1].reshape(-1, seq_len)
-                        y = local[1:].reshape(-1, seq_len)
-                        optimizer.zero_grad(set_to_none=True)
-                        with torch.autocast(device_type=autocast_device, dtype=autocast_dtype):
-                            loss = base_model(x, y)
-                        loss.backward()
-                        if world_size > 1 and dist.is_available() and dist.is_initialized():
-                            for p in ttt_params:
-                                if p.grad is not None:
-                                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
-                        torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
-                        optimizer.step()
-
-        if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
-            elapsed = time.perf_counter() - t0
-            rl = loss_sum.item() / max(token_count.item(), 1)
-            rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1)) if token_count.item() > 0 else 0.0
-            log0(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s")
-
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
-
-    val_loss = (loss_sum / token_count).item()
-    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
-
-    # Restore all params to requires_grad=True and set eval mode
-    for p in base_model.parameters():
-        p.requires_grad_(True)
-    base_model.eval()
-
-    log0(f"ttt_sliding:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
-         f"elapsed={time.perf_counter() - t0:.1f}s")
-    return val_loss, val_bpb
 
 
 def generate_autoregressive_calib(model, device, num_seqs=64, seq_len=2048,
@@ -1524,8 +1152,6 @@ def collect_hessians_from_tokens(hessian_model, token_seqs, device):
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
-    if "mamba_blocks" in name:
-        return "mamba"
     if ".mlp." in name:
         return "mlp"
     if ".attn." in name or (".proj." in name and ".mlp." not in name):
@@ -1631,7 +1257,6 @@ def _quantize_int6_percentile(t32, clip_range=31):
 def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int, n_attn: int | None = None) -> dict[str, Tensor]:
     """Convert 3D bank tensors into individual 2D tensors with standard names.
     n_attn: number of attention layers (bank size). If None, defaults to num_layers (backward compat).
-    Mamba params pass through unchanged.
     """
     out: dict[str, Tensor] = {}
     n = n_attn if n_attn is not None else num_layers
@@ -1651,7 +1276,6 @@ def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int, n_attn: int | Non
             for i in range(n):
                 out[f"blocks.{i}.mlp.proj.weight"] = tensor[i]
         else:
-            # Mamba params (mamba_blocks.*) pass through unchanged
             out[name] = tensor
     return out
 
@@ -1772,57 +1396,13 @@ class _HessianBlock(nn.Module):
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
         return x_out
 
-class _HessianMambaBlock(nn.Module):
-    """Mamba block with CastedLinear for in_proj/out_proj Hessian collection."""
-    def __init__(self, d_model=512, d_state=32, d_conv=4, expand=1.5):
-        super().__init__()
-        d_inner = int(expand * d_model)
-        self.d_inner = d_inner
-        self.d_state = d_state
-        dt_rank = max(d_model // 16, 1)
-        self.dt_rank = dt_rank
-        self.in_proj = CastedLinear(d_model, d_inner * 2 + d_state + dt_rank, bias=False)
-        self.conv1d = nn.Conv1d(d_inner, d_inner, d_conv, padding=d_conv - 1, groups=d_inner)
-        self.dt_proj = nn.Linear(dt_rank, d_inner, bias=True)
-        self.A_log = nn.Parameter(torch.log(torch.arange(1, d_state + 1, dtype=torch.float32).unsqueeze(0).expand(d_inner, -1).clone()))
-        self.D = nn.Parameter(torch.ones(d_inner, dtype=torch.float32))
-        self.c_proj = nn.Linear(d_model, d_state, bias=False)
-        self.out_proj = CastedLinear(d_inner, d_model, bias=False)
-        self.norm = RMSNorm()
-    def forward(self, x):
-        residual = x
-        x = self.norm(x)
-        proj = self.in_proj(x)
-        x_in, z, B_ssm, dt_in = proj.split([self.d_inner, self.d_inner, self.d_state, self.dt_rank], dim=-1)
-        x_in = x_in.transpose(1, 2)
-        x_in = self.conv1d(x_in)[:, :, :x.size(1)]
-        x_in = x_in.transpose(1, 2)
-        x_in = F.silu(x_in)
-        C = self.c_proj(x)
-        A = -torch.exp(self.A_log.float())
-        dt = F.softplus(self.dt_proj(dt_in))
-        dA = torch.exp(dt.unsqueeze(-1) * A)
-        dB = dt.unsqueeze(-1) * B_ssm.unsqueeze(2)
-        B_batch, L, d_inner = x_in.shape
-        h = torch.zeros(B_batch, d_inner, self.d_state, device=x_in.device, dtype=x_in.dtype)
-        ys = []
-        for t in range(L):
-            h = dA[:, t] * h + dB[:, t] * x_in[:, t, :, None]
-            y_t = (h * C[:, t, None, :]).sum(-1) + self.D * x_in[:, t]
-            ys.append(y_t)
-        y = torch.stack(ys, dim=1)
-        y = y * F.silu(z)
-        y = self.out_proj(y)
-        return residual + y
-
 class _HessianGPT(nn.Module):
     """Non-banked GPT model matching unbanked state dict keys for Hessian collection."""
     def __init__(self, vocab_size, num_layers, model_dim, num_heads, num_kv_heads,
                  mlp_mult, tie_embeddings, logit_softcap, rope_base, qk_gain_init,
                  bigram_vocab_size=0, bigram_dim=128, xsa_last_n=0,
                  rope_dims=0, ln_scale=False,
-                 ve_enabled=False, ve_dim=128, ve_layers="9,10",
-                 mamba_layers="", mamba_d_state=32, mamba_d_conv=4, mamba_expand=1.5):
+                 ve_enabled=False, ve_dim=128, ve_layers="9,10"):
         super().__init__()
         self.tie_embeddings = tie_embeddings
         self.logit_softcap = logit_softcap
@@ -1834,34 +1414,19 @@ class _HessianGPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        # Parse Mamba layers
-        self.mamba_layer_set = set()
-        if mamba_layers.strip():
-            self.mamba_layer_set = {int(x.strip()) for x in mamba_layers.split(",") if x.strip()}
-        # Build Mamba blocks and attention blocks separately
-        self.mamba_blocks = nn.ModuleList()
-        attn_blocks = []
-        self.mamba_idx_map = {}
-        self.attn_idx_map = {}
-        for i in range(num_layers):
-            if i in self.mamba_layer_set:
-                self.mamba_idx_map[i] = len(self.mamba_blocks)
-                self.mamba_blocks.append(_HessianMambaBlock(model_dim, mamba_d_state, mamba_d_conv, mamba_expand))
-            else:
-                self.attn_idx_map[i] = len(attn_blocks)
-                attn_blocks.append(_HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                                                 layer_idx=i, ln_scale=ln_scale))
-        self.blocks = nn.ModuleList(attn_blocks)
+        self.blocks = nn.ModuleList([
+            _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                          layer_idx=i, ln_scale=ln_scale)
+            for i in range(num_layers)
+        ])
         if rope_dims > 0:
             head_dim = model_dim // num_heads
             for block in self.blocks:
                 block.attn.rope_dims = rope_dims
                 block.attn.rotary = Rotary(head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
         if xsa_last_n > 0:
-            # XSA applies to last N attention layers (by global layer index)
-            attn_layer_indices = sorted(self.attn_idx_map.keys())
-            for gi in attn_layer_indices[-xsa_last_n:]:
-                self.blocks[self.attn_idx_map[gi]].attn.use_xsa = True
+            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+                self.blocks[i].attn.use_xsa = True
         kv_dim = num_kv_heads * (model_dim // num_heads)
         self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
         if self.ve_layer_indices:
@@ -1880,13 +1445,8 @@ class _HessianGPT(nn.Module):
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_cache['ve'] * self.ve_layer_scales[ve_idx].to(dtype=ve_cache['ve'].dtype)
     def _forward_layer(self, layer_idx, x, x0, input_ids, ve_cache):
-        if layer_idx in self.mamba_layer_set:
-            mi = self.mamba_idx_map[layer_idx]
-            return self.mamba_blocks[mi](x)
-        else:
-            ai = self.attn_idx_map[layer_idx]
-            ve = self._get_ve(layer_idx, input_ids, ve_cache)
-            return self.blocks[ai](x, x0, v_embed=ve)
+        ve = self._get_ve(layer_idx, input_ids, ve_cache)
+        return self.blocks[layer_idx](x, x0, v_embed=ve)
     def forward(self, input_ids, target_ids):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -2149,10 +1709,6 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
-        mamba_layers=args.mamba_layers,
-        mamba_d_state=args.mamba_d_state,
-        mamba_d_conv=args.mamba_d_conv,
-        mamba_expand=args.mamba_expand,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -2163,16 +1719,9 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    base_model._mamba_grad_checkpoint = args.mamba_grad_checkpoint
-    if base_model.mamba_layer_set:
-        assert HAS_MAMBA_CUDA, "mamba-ssm CUDA kernels required for Mamba layers — install mamba-ssm>=2.2.0"
-        assert HAS_CAUSAL_CONV1D, "causal-conv1d required for Mamba layers — install causal-conv1d>=1.4.0"
     # No DDP -- Parallel Muon handles bank grad communication via reduce-scatter,
     # and non-bank grads are manually all-reduced before Adam steps.
-    has_mamba = len(base_model.mamba_layer_set) > 0
-    if has_mamba:
-        torch._dynamo.config.cache_size_limit = 64
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=not has_mamba)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model = compiled_model
 
     # Optimizer split:
@@ -2190,15 +1739,6 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    # Mamba params: matrix weights -> Muon, scalar/1D params -> Adam
-    mamba_matrix_params = []
-    for mb in base_model.mamba_blocks:
-        mamba_matrix_params.extend([mb.in_proj.weight, mb.out_proj.weight,
-                                    mb.dt_proj.weight, mb.c_proj.weight])
-    for mb in base_model.mamba_blocks:
-        scalar_params.extend([mb.A_log, mb.D, mb.dt_proj.bias])
-        scalar_params.extend(list(mb.conv1d.parameters()))
-        scalar_params.extend(list(mb.norm.parameters()))
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
@@ -2225,12 +1765,8 @@ def main() -> None:
         fused=True,
     )
     # Muon for banked attention params
-    muon_param_groups = [{"params": matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}]
-    # Muon for Mamba matrix params (separate LR)
-    if mamba_matrix_params:
-        muon_param_groups.append({"params": mamba_matrix_params, "lr": args.mamba_matrix_lr, "base_lr": args.mamba_matrix_lr})
     optimizer_muon = Muon(
-        muon_param_groups,
+        [{"params": matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
@@ -2248,8 +1784,6 @@ def main() -> None:
     for pg in optimizer_tok.param_groups[1:]:
         replicated_params.extend(pg["params"])
     replicated_params.extend(scalar_params)
-    # Note: mamba_matrix_params are handled by Muon's reduce-scatter, NOT replicated_params
-
     optimizer_head = None
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
@@ -2264,11 +1798,8 @@ def main() -> None:
         optimizers.append(optimizer_head)
     n_params = sum(p.numel() for p in base_model.parameters())
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
-    mamba_params = sum(p.numel() for p in base_model.mamba_blocks.parameters())
-    log0(f"model_params:{n_params} mamba_params:{mamba_params}")
+    log0(f"model_params:{n_params}")
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
-    log0(f"hybrid: {len(base_model.mamba_layer_set)} mamba + {base_model.n_attn} attn = {args.num_layers} total layers")
-    log0(f"mamba_layers:{sorted(base_model.mamba_layer_set)} d_state:{args.mamba_d_state} d_conv:{args.mamba_d_conv} expand:{args.mamba_expand}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -2277,7 +1808,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} mamba_matrix_lr:{args.mamba_matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -2496,8 +2027,6 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-        mamba_layers=args.mamba_layers, mamba_d_state=args.mamba_d_state,
-        mamba_d_conv=args.mamba_d_conv, mamba_expand=args.mamba_expand,
     ).to(device).bfloat16()
     for m in hessian_model.modules():
         if isinstance(m, CastedLinear):
@@ -2523,7 +2052,7 @@ def main() -> None:
     del ar_tokens
     del hessian_model
     torch.cuda.empty_cache()
-    quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn", "mamba"}, hessians=hessians,
+    quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"}, hessians=hessians,
                                                     mixed_precision=args.gptq_mixed_precision)
     # Log bit allocation summary
     bit_counts: dict[str, int] = {}
@@ -2611,8 +2140,6 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
-        mamba_layers=args.mamba_layers, mamba_d_state=args.mamba_d_state,
-        mamba_d_conv=args.mamba_d_conv, mamba_expand=args.mamba_expand,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
@@ -2623,10 +2150,7 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    has_mamba_eval = hasattr(eval_model, 'mamba_layer_set') and len(eval_model.mamba_layer_set) > 0
-    if has_mamba_eval:
-        torch._dynamo.config.cache_size_limit = 64
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=not has_mamba_eval)
+    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -2673,23 +2197,6 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
-    # --- Optional test-time training (TTT) ---
-    if args.ttt_enabled:
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t_ttt = time.perf_counter()
-        ttt_loss, ttt_bpb = eval_val_sliding_ttt(
-            args, eval_model, rank, world_size, device,
-            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride, eval_seq_len=effective_eval_seq_len, log0=log0,
-        )
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        log0(
-            f"final_ttt_sliding val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
-            f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
-        )
-        log0(f"final_ttt_sliding_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":
