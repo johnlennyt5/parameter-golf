@@ -2082,6 +2082,12 @@ def main() -> None:
                     ones_info.append((qk, fi, err))
     n_prune = 0
     target_bytes = int(target_mb * 1024 * 1024)
+    # Compress unpruned first (needed for artifact anyway)
+    quant_buf = io.BytesIO()
+    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
+    quant_raw = quant_buf.getvalue()
+    quant_blob = lzma.compress(quant_raw, preset=9)
+    sz0 = len(quant_blob) + code_bytes_est
     if ones_info:
         ones_info.sort(key=lambda x: x[2])
         def _apply_prune(n):
@@ -2089,42 +2095,34 @@ def main() -> None:
             for i in range(min(n, len(ones_info))):
                 tmp[ones_info[i][0]].view(-1)[ones_info[i][1]] = 0
             return tmp
-        def _zlib_est(tmp):
+        def _lzma_size(tmp):
             buf = io.BytesIO(); torch.save({"w": tmp, "m": quant_meta}, buf)
-            return int(len(zlib.compress(buf.getvalue(), level=1)) * 0.95) + code_bytes_est
-        # Two fast zlib estimates (~1s each) for linear interpolation
-        est0 = _zlib_est(quant_result)
-        log0(f"selective_prune: {len(ones_info)} ±1 candidates, est={est0/(1024*1024):.2f}MB target={target_mb}MB")
-        if est0 > target_bytes:
-            full_tmp = _apply_prune(len(ones_info))
-            est_full = _zlib_est(full_tmp)
-            log0(f"selective_prune: full prune est={est_full/(1024*1024):.2f}MB")
-            if est_full > target_bytes:
-                log0("selective_prune: even full prune may not fit, applying all")
+            return len(lzma.compress(buf.getvalue(), preset=9)) + code_bytes_est
+        log0(f"selective_prune: {len(ones_info)} ±1 candidates, unpruned={sz0/(1024*1024):.2f}MB target={target_mb}MB")
+        if sz0 > target_bytes:
+            sz_full = _lzma_size(_apply_prune(len(ones_info)))
+            log0(f"selective_prune: full prune={sz_full/(1024*1024):.2f}MB")
+            if sz_full > target_bytes:
+                log0("selective_prune: even full prune not enough, applying all")
                 n_prune = len(ones_info)
-                quant_result = full_tmp
             else:
-                frac = (est0 - target_bytes) / max(est0 - est_full, 1)
-                n_prune = min(int(len(ones_info) * frac * 1.25) + 10, len(ones_info))
+                frac = (sz0 - target_bytes) / max(sz0 - sz_full, 1)
+                n_prune = min(int(len(ones_info) * frac * 1.10) + 10, len(ones_info))
                 log0(f"selective_prune: interpolated {n_prune}/{len(ones_info)} ({100*n_prune/len(ones_info):.1f}%)")
-                quant_result = _apply_prune(n_prune)
-    # Final LZMA9 compression (mandatory for artifact)
-    quant_buf = io.BytesIO()
-    torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = lzma.compress(quant_raw, preset=9)
-    # Post-hoc correction: if LZMA9 is larger than zlib estimate predicted, prune more
-    if ones_info and (len(quant_blob) + code_bytes_est) > target_bytes and n_prune < len(ones_info):
-        for _retry in range(6):
-            old_n = n_prune
-            n_prune = min(int(n_prune * 1.5) + 500, len(ones_info))
-            log0(f"selective_prune: retry, {old_n}->{n_prune}/{len(ones_info)}")
             quant_result = _apply_prune(n_prune)
             quant_buf = io.BytesIO()
             torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-            quant_blob = lzma.compress(quant_buf.getvalue(), preset=9)
-            if (len(quant_blob) + code_bytes_est) <= target_bytes:
-                break
+            quant_raw = quant_buf.getvalue()
+            quant_blob = lzma.compress(quant_raw, preset=9)
+            # If interpolation was slightly off, increase pruning
+            while (len(quant_blob) + code_bytes_est) > target_bytes and n_prune < len(ones_info):
+                old_n = n_prune
+                n_prune = min(int(n_prune * 1.2) + 200, len(ones_info))
+                log0(f"selective_prune: adjust {old_n}->{n_prune}/{len(ones_info)}")
+                quant_result = _apply_prune(n_prune)
+                quant_buf = io.BytesIO()
+                torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
+                quant_blob = lzma.compress(quant_buf.getvalue(), preset=9)
     if master_process:
         with open("final_model.int6.ptz", "wb") as f:
             f.write(quant_blob)
