@@ -2091,7 +2091,7 @@ def main() -> None:
             return tmp
         def _zlib_est(tmp):
             buf = io.BytesIO(); torch.save({"w": tmp, "m": quant_meta}, buf)
-            return int(len(zlib.compress(buf.getvalue(), level=1)) * 0.89) + code_bytes_est
+            return int(len(zlib.compress(buf.getvalue(), level=1)) * 0.95) + code_bytes_est
         # Two fast zlib estimates (~1s each) for linear interpolation
         est0 = _zlib_est(quant_result)
         log0(f"selective_prune: {len(ones_info)} ±1 candidates, est={est0/(1024*1024):.2f}MB target={target_mb}MB")
@@ -2115,9 +2115,9 @@ def main() -> None:
     quant_blob = lzma.compress(quant_raw, preset=9)
     # Post-hoc correction: if LZMA9 is larger than zlib estimate predicted, prune more
     if ones_info and (len(quant_blob) + code_bytes_est) > target_bytes and n_prune < len(ones_info):
-        for _retry in range(3):
+        for _retry in range(6):
             old_n = n_prune
-            n_prune = min(int(n_prune * 1.15) + 50, len(ones_info))
+            n_prune = min(int(n_prune * 1.5) + 500, len(ones_info))
             log0(f"selective_prune: retry, {old_n}->{n_prune}/{len(ones_info)}")
             quant_result = _apply_prune(n_prune)
             quant_buf = io.BytesIO()
