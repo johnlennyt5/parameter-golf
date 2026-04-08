@@ -39,7 +39,7 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 4000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
@@ -81,14 +81,14 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 8192))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 112))
-    trigram_enabled = bool(int(os.environ.get("TRIGRAM", "1")))  # TrigramHash (on by default for EngramLite)
+    trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default — adds 23ms/step overhead)
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on ALL layers (our novel contribution)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
-    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0))
+    late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
@@ -1991,6 +1991,7 @@ def main() -> None:
         current_state = base_model.state_dict()
         avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
         base_model.load_state_dict(avg_state, strict=True)
+    t_post_train_start = time.perf_counter()
     torch.cuda.synchronize()
     t_diag = time.perf_counter()
     diag_val_loss, diag_val_bpb = eval_val(
@@ -2038,11 +2039,11 @@ def main() -> None:
         strict=False,
     )
     # Autoregressive self-generated calibration (no external data)
-    log0("gptq:generating autoregressive calibration data (64 seqs x 2048 tokens, temp=0.8)...")
+    log0("gptq:generating autoregressive calibration data (32 seqs x 2048 tokens, temp=0.8)...")
     base_model.load_state_dict(export_sd, strict=False)
     t_gen = time.perf_counter()
     ar_tokens = generate_autoregressive_calib(
-        base_model, device, num_seqs=64, seq_len=args.train_seq_len,
+        base_model, device, num_seqs=32, seq_len=args.train_seq_len,
         vocab_size=args.vocab_size, temperature=0.8, batch_size=8, seed=args.seed,
     )
     log0(f"gptq:generated {len(ar_tokens)} sequences in {time.perf_counter()-t_gen:.1f}s")
@@ -2081,32 +2082,53 @@ def main() -> None:
                     ones_info.append((qk, fi, err))
     if ones_info:
         ones_info.sort(key=lambda x: x[2])
-        def _try_prune(n):
+        def _apply_prune(n):
+            """Apply pruning to quant_result (returns modified copy)."""
             tmp = {k: v.clone() for k, v in quant_result.items()}
             for i in range(min(n, len(ones_info))):
                 tmp[ones_info[i][0]].view(-1)[ones_info[i][1]] = 0
+            return tmp
+        def _exact_size(tmp):
+            """Exact compressed size using LZMA preset=9 (slow)."""
             buf = io.BytesIO(); torch.save({"w": tmp, "m": quant_meta}, buf)
-            return len(lzma.compress(buf.getvalue(), preset=9)) + code_bytes_est, tmp
-        no_sz, _ = _try_prune(0)
+            return len(lzma.compress(buf.getvalue(), preset=9)) + code_bytes_est
+        def _fast_size(tmp):
+            """Fast size estimate using zlib (10-50x faster than LZMA)."""
+            buf = io.BytesIO(); torch.save({"w": tmp, "m": quant_meta}, buf)
+            zlib_sz = len(zlib.compress(buf.getvalue(), level=1))
+            return int(zlib_sz * 0.89) + code_bytes_est  # LZMA is ~11% smaller than zlib
+        no_prune_tmp = _apply_prune(0)
+        no_sz = _exact_size(no_prune_tmp)
         target_bytes = int(target_mb * 1024 * 1024)
         log0(f"selective_prune: {len(ones_info)} ±1 candidates, unpruned={no_sz/(1024*1024):.2f}MB target={target_mb}MB")
         if no_sz <= target_bytes:
             log0("selective_prune: already fits, no pruning needed")
         else:
-            full_sz, _ = _try_prune(len(ones_info))
+            full_tmp = _apply_prune(len(ones_info))
+            full_sz = _exact_size(full_tmp)
             log0(f"selective_prune: full ±1 prune={full_sz/(1024*1024):.2f}MB")
             if full_sz > target_bytes:
                 log0("selective_prune: even full prune not enough, applying all")
-                _, quant_result = _try_prune(len(ones_info))
+                quant_result = full_tmp
             else:
+                # Binary search using fast zlib estimate (seconds, not minutes)
                 lo, hi = 0, len(ones_info)
                 while lo < hi:
                     mid = (lo + hi) // 2
-                    sz, _ = _try_prune(mid)
+                    sz = _fast_size(_apply_prune(mid))
                     if sz <= target_bytes: hi = mid
                     else: lo = mid + 1
+                # Add 5% safety margin then verify with exact LZMA
+                lo = min(int(lo * 1.05) + 1, len(ones_info))
+                final_tmp = _apply_prune(lo)
+                final_sz = _exact_size(final_tmp)
+                # If safety margin wasn't enough, step up until it fits
+                while final_sz > target_bytes and lo < len(ones_info):
+                    lo = min(lo + max(1, len(ones_info) // 100), len(ones_info))
+                    final_tmp = _apply_prune(lo)
+                    final_sz = _exact_size(final_tmp)
                 log0(f"selective_prune: pruning {lo}/{len(ones_info)} ±1 values ({100*lo/len(ones_info):.1f}%) to fit {target_mb}MB")
-                _, quant_result = _try_prune(lo)
+                quant_result = final_tmp
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -2181,7 +2203,10 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
-    if args.eval_stride != 64 and 64 < sw_seq_len:
+    post_train_elapsed = time.perf_counter() - t_post_train_start
+    if post_train_elapsed > 480:
+        log0(f"time_budget: skipping secondary sliding eval (elapsed {post_train_elapsed:.0f}s > 480s)")
+    elif args.eval_stride != 64 and 64 < sw_seq_len:
         torch.cuda.synchronize()
         t_slide64 = time.perf_counter()
         sw64_val_loss, sw64_val_bpb = eval_val_sliding(
