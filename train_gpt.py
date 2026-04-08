@@ -2080,59 +2080,51 @@ def main() -> None:
                 errors = s.float()[row_idx].pow(2)
                 for fi, err in zip(flat_idx.tolist(), errors.tolist()):
                     ones_info.append((qk, fi, err))
+    n_prune = 0
+    target_bytes = int(target_mb * 1024 * 1024)
     if ones_info:
         ones_info.sort(key=lambda x: x[2])
         def _apply_prune(n):
-            """Apply pruning to quant_result (returns modified copy)."""
             tmp = {k: v.clone() for k, v in quant_result.items()}
             for i in range(min(n, len(ones_info))):
                 tmp[ones_info[i][0]].view(-1)[ones_info[i][1]] = 0
             return tmp
-        def _exact_size(tmp):
-            """Exact compressed size using LZMA preset=9 (slow)."""
+        def _zlib_est(tmp):
             buf = io.BytesIO(); torch.save({"w": tmp, "m": quant_meta}, buf)
-            return len(lzma.compress(buf.getvalue(), preset=9)) + code_bytes_est
-        def _fast_size(tmp):
-            """Fast size estimate using zlib (10-50x faster than LZMA)."""
-            buf = io.BytesIO(); torch.save({"w": tmp, "m": quant_meta}, buf)
-            zlib_sz = len(zlib.compress(buf.getvalue(), level=1))
-            return int(zlib_sz * 0.89) + code_bytes_est  # LZMA is ~11% smaller than zlib
-        no_prune_tmp = _apply_prune(0)
-        no_sz = _exact_size(no_prune_tmp)
-        target_bytes = int(target_mb * 1024 * 1024)
-        log0(f"selective_prune: {len(ones_info)} ±1 candidates, unpruned={no_sz/(1024*1024):.2f}MB target={target_mb}MB")
-        if no_sz <= target_bytes:
-            log0("selective_prune: already fits, no pruning needed")
-        else:
+            return int(len(zlib.compress(buf.getvalue(), level=1)) * 0.89) + code_bytes_est
+        # Two fast zlib estimates (~1s each) for linear interpolation
+        est0 = _zlib_est(quant_result)
+        log0(f"selective_prune: {len(ones_info)} ±1 candidates, est={est0/(1024*1024):.2f}MB target={target_mb}MB")
+        if est0 > target_bytes:
             full_tmp = _apply_prune(len(ones_info))
-            full_sz = _exact_size(full_tmp)
-            log0(f"selective_prune: full ±1 prune={full_sz/(1024*1024):.2f}MB")
-            if full_sz > target_bytes:
-                log0("selective_prune: even full prune not enough, applying all")
+            est_full = _zlib_est(full_tmp)
+            log0(f"selective_prune: full prune est={est_full/(1024*1024):.2f}MB")
+            if est_full > target_bytes:
+                log0("selective_prune: even full prune may not fit, applying all")
+                n_prune = len(ones_info)
                 quant_result = full_tmp
             else:
-                # Binary search using fast zlib estimate (seconds, not minutes)
-                lo, hi = 0, len(ones_info)
-                while lo < hi:
-                    mid = (lo + hi) // 2
-                    sz = _fast_size(_apply_prune(mid))
-                    if sz <= target_bytes: hi = mid
-                    else: lo = mid + 1
-                # Add 5% safety margin then verify with exact LZMA
-                lo = min(int(lo * 1.05) + 1, len(ones_info))
-                final_tmp = _apply_prune(lo)
-                final_sz = _exact_size(final_tmp)
-                # If safety margin wasn't enough, step up until it fits
-                while final_sz > target_bytes and lo < len(ones_info):
-                    lo = min(lo + max(1, len(ones_info) // 100), len(ones_info))
-                    final_tmp = _apply_prune(lo)
-                    final_sz = _exact_size(final_tmp)
-                log0(f"selective_prune: pruning {lo}/{len(ones_info)} ±1 values ({100*lo/len(ones_info):.1f}%) to fit {target_mb}MB")
-                quant_result = final_tmp
+                frac = (est0 - target_bytes) / max(est0 - est_full, 1)
+                n_prune = min(int(len(ones_info) * frac * 1.25) + 10, len(ones_info))
+                log0(f"selective_prune: interpolated {n_prune}/{len(ones_info)} ({100*n_prune/len(ones_info):.1f}%)")
+                quant_result = _apply_prune(n_prune)
+    # Final LZMA9 compression (mandatory for artifact)
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob = lzma.compress(quant_raw, preset=9)
+    # Post-hoc correction: if LZMA9 is larger than zlib estimate predicted, prune more
+    if ones_info and (len(quant_blob) + code_bytes_est) > target_bytes and n_prune < len(ones_info):
+        for _retry in range(3):
+            old_n = n_prune
+            n_prune = min(int(n_prune * 1.15) + 50, len(ones_info))
+            log0(f"selective_prune: retry, {old_n}->{n_prune}/{len(ones_info)}")
+            quant_result = _apply_prune(n_prune)
+            quant_buf = io.BytesIO()
+            torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
+            quant_blob = lzma.compress(quant_buf.getvalue(), preset=9)
+            if (len(quant_blob) + code_bytes_est) <= target_bytes:
+                break
     if master_process:
         with open("final_model.int6.ptz", "wb") as f:
             f.write(quant_blob)
