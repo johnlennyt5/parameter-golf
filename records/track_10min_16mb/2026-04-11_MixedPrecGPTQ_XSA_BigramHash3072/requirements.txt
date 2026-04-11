@@ -1,0 +1,7 @@
+torch
+sentencepiece
+zstandard
+flash-attn
+huggingface-hub
+numpy
+tqdm

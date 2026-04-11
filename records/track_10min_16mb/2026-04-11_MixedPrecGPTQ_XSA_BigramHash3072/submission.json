@@ -1,0 +1,47 @@
+{
+  "author": "abaybektursun",
+  "github_id": "abaybektursun",
+  "name": "Mixed-Precision GPTQ (int5/int6/int7) + XSA-all + BigramHash 3072x112",
+  "blurb": "11L XSA-all + Hessian-guided mixed-precision GPTQ (int5/int6/int7 bit allocation per layer) with AR self-generated calibration + selective pruning. BigramHash(3072,112), warmdown=4000, lzma preset=9. 3-seed mean: 1.11779269 BPB / 1.88734114 nats.",
+  "date": "2026-04-11",
+  "track": "10min_16mb",
+  "val_loss": 1.88734114,
+  "val_bpb": 1.11779269,
+  "val_loss_std": 0.00140,
+  "val_bpb_std": 0.00083,
+  "seeds": [314, 42, 999],
+  "seed_results": {
+    "314": {
+      "val_loss": 1.88717077,
+      "val_bpb": 1.11769179,
+      "artifact_bytes": 15787791,
+      "steps": 6925,
+      "step_avg_ms": 86.65
+    },
+    "42": {
+      "val_loss": 1.88603392,
+      "val_bpb": 1.11701848,
+      "artifact_bytes": 15816235,
+      "steps": 6948,
+      "step_avg_ms": 86.37
+    },
+    "999": {
+      "val_loss": 1.88881873,
+      "val_bpb": 1.11866781,
+      "artifact_bytes": 15791603,
+      "steps": 6944,
+      "step_avg_ms": 86.42
+    }
+  },
+  "artifact_bytes_mean": 15798543,
+  "artifact_bytes_max": 15816235,
+  "bytes_total": 15816235,
+  "train_steps_mean": 6939,
+  "step_avg_ms_mean": 86.48,
+  "hardware": "8xH100 80GB SXM",
+  "pytorch_version": "2.9.1+cu128",
+  "cuda_version": "12.8",
+  "flash_attn_version": "2.8.3 (FA3 Hopper kernels)",
+  "calibration": "AR self-generated (32 seqs x 2048 tokens, temp=0.8, no external data)",
+  "technique_summary": "Hessian-guided mixed-precision GPTQ (int5/int6/int7) + AR self-gen calibration + XSA-all + BigramHash 3072x112 + Parallel Muon + LZMA9"
+}

@@ -1,0 +1,39 @@
+seed:314
+model_params:27067484
+world_size:8 grad_accum_steps:1
+train_batch_tokens:786432 train_seq_len:2048 iterations:20000 warmup_steps:20 max_wallclock_seconds:600.000
+step:0/20000 val_loss:6.9271 val_bpb:4.1026 train_time:0ms step_avg:0.01ms
+step:500/20000 train_loss:2.3847 train_time:42997ms step_avg:85.99ms
+step:1000/20000 train_loss:2.2546 train_time:86338ms step_avg:86.34ms
+step:1500/20000 train_loss:2.1994 train_time:129789ms step_avg:86.53ms
+step:2000/20000 train_loss:2.0441 train_time:173165ms step_avg:86.58ms
+step:2500/20000 train_loss:2.1503 train_time:216465ms step_avg:86.59ms
+step:3000/20000 train_loss:2.1396 train_time:259732ms step_avg:86.58ms
+step:3500/20000 train_loss:2.1490 train_time:302974ms step_avg:86.56ms
+step:4000/20000 train_loss:1.9422 train_time:346211ms step_avg:86.55ms
+step:4000/20000 val_loss:2.0347 val_bpb:1.2050 train_time:346262ms step_avg:86.57ms
+step:4500/20000 train_loss:2.0972 train_time:389442ms step_avg:86.54ms
+step:5000/20000 train_loss:2.0767 train_time:432657ms step_avg:86.53ms
+step:5500/20000 train_loss:1.9934 train_time:475872ms step_avg:86.52ms
+step:6000/20000 train_loss:1.9215 train_time:519056ms step_avg:86.51ms
+swa:start step:6150
+late_qat:enabled step:6333 scale:0.1498
+step:6500/20000 train_loss:2.0607 train_time:562750ms step_avg:86.58ms
+step:6925/20000 val_loss:1.9172 val_bpb:1.1355 train_time:600051ms step_avg:86.65ms
+stopping_early: wallclock_cap train_time:600051ms step:6925/20000
+peak memory allocated: 22858 MiB reserved: 22924 MiB
+ema:applying EMA weights
+DIAGNOSTIC post_ema val_loss:1.9156 val_bpb:1.1345 eval_time:2074ms
+Serialized model: 106289590 bytes
+Code size: 106423 bytes
+gptq:bit allocation: {'int7': 14, 'int6': 33, 'int5': 19, 'int8': 3}
+selective_prune: 4208075 candidates, unpruned=15.30MB target=15.1MB
+selective_prune: full prune=14.22MB
+selective_prune: interpolated 848115/4208075 (20.2%)
+selective_prune: adjust 848115->1017938/4208075
+Serialized model int6+lzma: 15681368 bytes
+Total submission size int6+lzma: 15787791 bytes
+final_int6_roundtrip val_loss:1.9270 val_bpb:1.1413 eval_time:20328ms
+final_int6_roundtrip_exact val_loss:1.92699496 val_bpb:1.14127496
+final_int6_sliding_window val_loss:1.8872 val_bpb:1.1177 stride:64 eval_time:100415ms
+final_int6_sliding_window_exact val_loss:1.88717077 val_bpb:1.11769179
