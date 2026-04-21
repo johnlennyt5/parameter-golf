@@ -77,20 +77,6 @@ class Hyperparameters:
     swa_every = int(os.environ.get("SWA_EVERY", 50))
     lawa_enabled = bool(int(os.environ.get("LAWA_ENABLED", "0")))
     lawa_k = int(os.environ.get("LAWA_K", 10))
-
-    # Curriculum vocabulary switching (BATTLE_PLAN Change 1)
-    vocab_schedule = os.environ.get("VOCAB_SCHEDULE", "4096@0,6144@2000,8192@4000")
-    current_vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
-
-    def parse_vocab_schedule(schedule_str):
-        """Parse vocab schedule string into list of (step, vocab_size) tuples."""
-        stages = []
-        for stage in schedule_str.split(','):
-            vocab, step = stage.split('@')
-            stages.append((int(step), int(vocab)))
-        return sorted(stages)
-
-    vocab_stages = parse_vocab_schedule(vocab_schedule)
     lawa_freq = int(os.environ.get("LAWA_FREQ", 100))
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
@@ -1994,31 +1980,6 @@ def main() -> None:
                     f"step:{step}/{args.iterations}"
                 )
             break
-
-        # Curriculum vocabulary switching (BATTLE_PLAN Change 4)
-        for switch_step, target_vocab in args.vocab_stages:
-            if step == switch_step and args.current_vocab_size != target_vocab:
-                log0(f"step:{step} switching vocab {args.current_vocab_size} → {target_vocab}")
-
-                # Extend embedding matrix
-                old_emb = base_model.tok_emb.weight.data.clone()
-                model_dim = args.model_dim
-                new_emb = torch.nn.Embedding(target_vocab, model_dim).to(device)
-                new_emb.weight.data[:args.current_vocab_size] = old_emb
-
-                # Initialize new rows via interpolation
-                for i in range(args.current_vocab_size, target_vocab):
-                    neighbors = torch.randint(0, args.current_vocab_size, (5,))
-                    new_emb.weight.data[i] = old_emb[neighbors].mean(dim=0)
-
-                base_model.tok_emb = new_emb
-                args.current_vocab_size = target_vocab
-
-                # Reload tokenizer and dataset
-                tokenizer_path = f"./data/tokenizers/fineweb_{target_vocab}_bpe.model"
-                data_path = f"./data/datasets/fineweb10B_sp{target_vocab}"
-                sp = spm.SentencePieceProcessor(model_file=tokenizer_path)
-                train_loader = DistributedTokenLoader(f"{data_path}/fineweb_train_*.bin", rank, world_size, device)
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
