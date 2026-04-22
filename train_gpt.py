@@ -45,8 +45,8 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 4096))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 4.0))  # Option D: SOTA uses 5.0-5.25
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))  # Option D: Back to proven baseline
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
@@ -78,8 +78,8 @@ class Hyperparameters:
     lawa_enabled = bool(int(os.environ.get("LAWA_ENABLED", "0")))
     lawa_k = int(os.environ.get("LAWA_K", 10))
     lawa_freq = int(os.environ.get("LAWA_FREQ", 100))
-    muon_wd = float(os.environ.get("MUON_WD", 0.04))
-    adam_wd = float(os.environ.get("ADAM_WD", 0.04))
+    muon_wd = float(os.environ.get("MUON_WD", 0.085))
+    adam_wd = float(os.environ.get("ADAM_WD", 0.085))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 112))
@@ -97,7 +97,7 @@ class Hyperparameters:
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
-    gptq_mixed_precision = bool(int(os.environ.get("GPTQ_MIXED_PRECISION", "0")))  # Disabled: uniform int6 avoids SP8192 degradation
+    gptq_mixed_precision = bool(int(os.environ.get("GPTQ_MIXED_PRECISION", "1")))  # Re-enabled: mixed int5/int6/int7/int8 for SP1024 baseline
 
 # --- Batched Newton-Schulz orthogonalization ---
 
