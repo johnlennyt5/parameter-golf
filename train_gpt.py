@@ -983,11 +983,13 @@ class GPT(nn.Module):
 
         # Apply temporal smoothing: blend each embedding with neighbors
         # This creates correlation structure similar to what SmearGate learns
+        # Use .data to avoid in-place operation errors on leaf variables
         smoothing_strength = 0.15  # 15% blend with neighbors
-        for i in range(1, vocab_size - 1):
-            # Blend current embedding with neighbors (weighted by BPE adjacency heuristic)
-            neighbor_blend = smoothing_strength * (embed_weight[i-1] + embed_weight[i+1]) / 2.0
-            embed_weight[i] = (1 - smoothing_strength) * embed_weight[i] + neighbor_blend
+        with torch.no_grad():
+            for i in range(1, vocab_size - 1):
+                # Blend current embedding with neighbors (weighted by BPE adjacency heuristic)
+                neighbor_blend = smoothing_strength * (embed_weight.data[i-1] + embed_weight.data[i+1]) / 2.0
+                embed_weight.data[i] = (1 - smoothing_strength) * embed_weight.data[i] + neighbor_blend
 
         # Log innovation application
         log_innovation('smeargate_init', vocab_size=vocab_size, smoothing=smoothing_strength)
