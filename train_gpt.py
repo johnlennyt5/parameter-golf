@@ -161,7 +161,7 @@ class Hyperparameters:
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
-    gptq_mixed_precision = bool(int(os.environ.get("GPTQ_MIXED_PRECISION", "0")))  # INNOVATION: Uniform int6 for SP8192 (will be overridden by BigramHash guidance)
+    gptq_mixed_precision = bool(int(os.environ.get("GPTQ_MIXED_PRECISION", "1")))  # FIX: Enable mixed precision (required for BigramHash guidance)
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1630,9 +1630,9 @@ def _compute_hessian_sensitivity(hessians: dict[str, Tensor]) -> dict[str, float
     return sensitivity
 
 def _compute_bigram_sensitivity(state_dict: dict[str, Tensor] | None, quantizable_names: list[str]) -> dict[str, float]:
-    """INNOVATION #3: BigramHash-Guided Quantization.
+    """INNOVATION #3 (FIXED): BigramHash-Guided Quantization.
     Compute per-layer sensitivity based on bigram embedding patterns.
-    Layers processing high-complexity bigram patterns need more precision."""
+    FIX: Use per-layer variance analysis instead of global constant."""
     bigram_sensitivity: dict[str, float] = {}
 
     # Try to extract bigram embedding from state dict
@@ -1645,25 +1645,50 @@ def _compute_bigram_sensitivity(state_dict: dict[str, Tensor] | None, quantizabl
         # No bigram module - return uniform sensitivity
         return {name: 1.0 for name in quantizable_names}
 
-    # Compute bigram embedding norm as proxy for pattern complexity
-    bigram_embed_norm = bigram_weight.data.norm(dim=-1).float()
-    mean_norm = bigram_embed_norm.mean().item()
-    std_norm = bigram_embed_norm.std().item()
+    # Compute per-embedding variance (proxy for pattern complexity)
+    bigram_variance = bigram_weight.data.var(dim=-1).float()  # Shape: [3072]
 
-    # Assign sensitivity per layer based on embedding statistics
-    # Higher embedding variance → more complex patterns → needs higher precision
+    # Compute percentile-based complexity scores (avoids outliers)
+    p25 = torch.quantile(bigram_variance, 0.25).item()
+    p75 = torch.quantile(bigram_variance, 0.75).item()
+    iqr = p75 - p25 + 1e-6
+
+    # FIX: Assign sensitivity per layer based on LAYER-SPECIFIC complexity patterns
     for name in quantizable_names:
         # Extract layer index from name (e.g., "blocks.5.attn.q" → layer 5)
         if "blocks." in name:
             parts = name.split(".")
             layer_idx = int(parts[1])
 
-            # Simple heuristic: later layers see more complex patterns
-            # Combine with embedding statistics
-            layer_factor = 0.5 + 0.5 * (layer_idx / 11.0)  # 0.5 to 1.0 progression
-            pattern_factor = 1.0 + std_norm / (mean_norm + 1e-6)  # Higher std → higher complexity
+            # FIX: Multi-factor heuristic with wider variance
+            # Factor 1: Depth (early layers = token-level, late layers = semantic)
+            depth_factor = 0.2 + 1.6 * (layer_idx / 11.0)  # 0.2 to 1.8 (9× range)
 
-            bigram_sensitivity[name] = layer_factor * pattern_factor
+            # Factor 2: Component type (attn needs more precision than MLP)
+            component_factor = 1.0
+            if ".attn." in name:
+                if ".q" in name or ".k" in name:
+                    component_factor = 1.3  # QK projection most critical
+                elif ".v" in name or ".c_proj" in name:
+                    component_factor = 1.1  # V and output important
+            elif ".mlp." in name:
+                component_factor = 0.9  # MLP less sensitive
+
+            # Factor 3: Bigram complexity (IQR-normalized)
+            # Use layer-specific slice of bigram embeddings for variation
+            slice_start = (layer_idx * 3072) // 12
+            slice_end = ((layer_idx + 1) * 3072) // 12
+            layer_variance = bigram_variance[slice_start:slice_end].mean().item()
+            complexity_factor = 0.5 + 1.0 * (layer_variance - p25) / iqr  # 0.5 to 1.5
+
+            # FIX: Skip compressor bottleneck protection
+            # Bottleneck layers (128-dim) need higher precision due to 4× compression
+            if "skip_compressors" in name and ".0.weight" in name:
+                # First layer of skip compressor (512→128 bottleneck)
+                component_factor *= 1.5  # Boost precision for bottleneck
+
+            # Combine all factors (wider range: ~0.1 to ~3.5)
+            bigram_sensitivity[name] = depth_factor * component_factor * complexity_factor
         else:
             bigram_sensitivity[name] = 1.0  # Default for non-layer params
 
@@ -1672,16 +1697,16 @@ def _compute_bigram_sensitivity(state_dict: dict[str, Tensor] | None, quantizabl
 def _assign_bit_widths(sensitivity: dict[str, float], quantizable_names: list[str],
                        bigram_sensitivity: dict[str, float] | None = None) -> dict[str, int]:
     """Assign int5/int6/int7 per layer based on Hessian + BigramHash sensitivity.
-    INNOVATION #3: Blend Hessian (precision needs) with BigramHash (pattern complexity).
-    Top 20% most sensitive → int7 (clip=63), bottom 30% → int5 (clip=15), rest → int6 (clip=31)."""
+    INNOVATION #3 (FIXED): Blend Hessian (precision needs) with BigramHash (pattern complexity).
+    FIX: Rebalanced to 50/50 blend (BigramHash now varies more) + aggressive distribution."""
     if not quantizable_names:
         return {}
 
-    # INNOVATION #3: Blend Hessian and BigramHash sensitivity
+    # FIX: Rebalanced blend (BigramHash now has wider variance, deserves equal weight)
     if bigram_sensitivity is not None:
-        # Weighted blend: 70% Hessian (empirical precision needs) + 30% BigramHash (pattern complexity)
+        # 50% Hessian (empirical precision needs) + 50% BigramHash (pattern complexity)
         blended_sensitivity = {
-            name: 0.7 * sensitivity.get(name, 0.0) + 0.3 * bigram_sensitivity.get(name, 1.0)
+            name: 0.5 * sensitivity.get(name, 0.0) + 0.5 * bigram_sensitivity.get(name, 1.0)
             for name in quantizable_names
         }
     else:
@@ -1690,9 +1715,12 @@ def _assign_bit_widths(sensitivity: dict[str, float], quantizable_names: list[st
     scores = [(name, blended_sensitivity[name]) for name in quantizable_names]
     scores.sort(key=lambda x: x[1])
     n = len(scores)
-    # Bottom 30% → int5, middle 50% → int6, top 20% → int7
-    int5_cutoff = int(n * 0.30)
-    int7_cutoff = int(n * 0.80)
+
+    # FIX: More aggressive distribution for better differentiation
+    # Bottom 25% → int5, middle 55% → int6, top 20% → int7
+    int5_cutoff = int(n * 0.25)  # Reduced from 0.30
+    int7_cutoff = int(n * 0.75)  # Reduced from 0.80 (more int7 allocation)
+
     bit_map: dict[str, int] = {}
     for i, (name, score) in enumerate(scores):
         if i < int5_cutoff:
