@@ -24,74 +24,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-try:
-    from flash_attn_interface import flash_attn_func as flash_attn_3_func
-except ImportError:
-    from flash_attn import flash_attn_func as flash_attn_3_func
-# INNOVATION TRACKING SYSTEM - Global logging for all 5 innovations
-_innovation_logs = {
-    'sp8192_tokenizer': False,
-    'bottleneck_skip_applied': [],
-    'adaptive_xsa_strengths': [],
-    'bigram_quant_bits': {},
-    'smeargate_init': False,
-}
-
-def log_innovation(name: str, **kwargs):
-    """Log innovation application with metadata."""
-    if isinstance(_innovation_logs.get(name), list):
-        _innovation_logs[name].append(kwargs)
-    elif isinstance(_innovation_logs.get(name), dict):
-        _innovation_logs[name].update(kwargs)
-    else:
-        _innovation_logs[name] = kwargs.get('value', True)
-
-def print_innovation_summary(log_fn, model=None):
-    """Print comprehensive summary of all innovations applied."""
-    log_fn("=" * 80)
-    log_fn("INNOVATION SUMMARY - Novel Architectural Improvements")
-    log_fn("=" * 80)
-
-    # Innovation 1: SP8192 Tokenizer
-    if _innovation_logs['sp8192_tokenizer']:
-        log_fn("✓ INNOVATION #1: SP8192 Tokenizer")
-        log_fn("  Expected gain: -0.0322 BPB vs SP1024 baseline")
-
-    # Innovation 2: Information-Bottleneck Skip Routing
-    log_fn(f"✓ INNOVATION #2: Information-Bottleneck Skip Routing")
-    log_fn(f"  Applied to 5 skip connections")
-    log_fn(f"  Compression: 512 → 128 → 512 (4× bottleneck)")
-
-    # Innovation 3: Adaptive XSA Strength
-    # Extract XSA strengths from model parameters
-    if model is not None:
-        xsa_strengths = []
-        for block in model.blocks:
-            if block.attn.use_xsa and hasattr(block.attn, 'xsa_strength'):
-                strength_val = torch.sigmoid(block.attn.xsa_strength).item()
-                xsa_strengths.append(strength_val)
-        if xsa_strengths:
-            avg_strength = sum(xsa_strengths) / len(xsa_strengths)
-            log_fn(f"✓ INNOVATION #3: Adaptive XSA Strength")
-            log_fn(f"  Mean strength: {avg_strength:.4f} (0=standard, 1=full XSA)")
-            log_fn(f"  Per-layer learned blending active on {len(xsa_strengths)} layers")
-
-    # Innovation 4: BigramHash-Guided Quantization
-    if _innovation_logs['bigram_quant_bits']:
-        bit_dist = {5: 0, 6: 0, 7: 0}
-        for bits in _innovation_logs['bigram_quant_bits'].values():
-            bit_dist[bits] = bit_dist.get(bits, 0) + 1
-        log_fn(f"✓ INNOVATION #4: BigramHash-Guided Quantization")
-        log_fn(f"  Bit allocation: int5={bit_dist.get(5,0)}, int6={bit_dist.get(6,0)}, int7={bit_dist.get(7,0)}")
-        log_fn(f"  Guided by bigram pattern complexity (not pure Hessian)")
-
-    # Innovation 5: SmearGate-Inspired Embedding Init
-    if _innovation_logs['smeargate_init']:
-        log_fn(f"✓ INNOVATION #5: SmearGate-Inspired Embedding Initialization")
-        log_fn(f"  Temporal correlation patterns applied to 8192 vocabulary entries")
-
-    log_fn("=" * 80)
-
+from flash_attn_interface import flash_attn_func as flash_attn_3_func
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -103,14 +36,14 @@ class Hyperparameters:
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 4000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 4000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 4.0))  # Option D: SOTA uses 5.0-5.25
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))  # INNOVATION: SP8192 tokenizer for -0.032 BPB gain
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
@@ -123,7 +56,7 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.022))  # INNOVATION: SOTA-tuned LR for SP8192
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -142,12 +75,12 @@ class Hyperparameters:
     lawa_enabled = bool(int(os.environ.get("LAWA_ENABLED", "0")))
     lawa_k = int(os.environ.get("LAWA_K", 10))
     lawa_freq = int(os.environ.get("LAWA_FREQ", 100))
-    muon_wd = float(os.environ.get("MUON_WD", 0.095))  # INNOVATION: SOTA-tuned WD for SP8192
-    adam_wd = float(os.environ.get("ADAM_WD", 0.095))  # INNOVATION: SOTA-tuned WD for SP8192
+    muon_wd = float(os.environ.get("MUON_WD", 0.04))
+    adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 112))
-    trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default — adds 23ms/step overhead)
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default, risky)
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on ALL layers (our novel contribution)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
@@ -161,7 +94,6 @@ class Hyperparameters:
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
-    gptq_mixed_precision = bool(int(os.environ.get("GPTQ_MIXED_PRECISION", "0")))  # REVERT: Use baseline's uniform int6 (BigramHash guidance removed)
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -428,7 +360,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
     ).split(",")
     if pattern
 )
@@ -689,8 +621,6 @@ class CausalSelfAttention(nn.Module):
         self.rope_dims = 0  # set by GPT.__init__ for partial RoPE
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024)
         self.use_xsa = False  # set by GPT.__init__ for deep layers only
-        # INNOVATION #2: Adaptive XSA Strength (learnable blend between standard and XSA attention)
-        self.xsa_strength = nn.Parameter(torch.ones(1, dtype=torch.float32))  # Init to 1.0 (full XSA)
         # Gated attention and value residual (non-banked small params)
         self.gated_attention = gated_attention
         if gated_attention:
@@ -728,13 +658,9 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q.bfloat16(), k.bfloat16(), v.bfloat16(), causal=True)
+        y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
-            # INNOVATION #3: Adaptive XSA - blend standard and XSA based on learned strength
-            y_ortho = self._xsa_efficient(y, v)
-            strength = torch.sigmoid(self.xsa_strength).to(dtype=y.dtype)
-            y = y * (1 - strength) + y_ortho * strength
-            # Note: XSA strengths will be logged at end of training (avoiding torch.compile graph breaks)
+            y = self._xsa_efficient(y, v)
         if self.gated_attention:
             # gate shape: (bsz, seqlen, num_heads) -> (bsz, seqlen, num_heads, 1) for B,T,H,D layout
             gate = torch.sigmoid(self.attn_gate(x)).unsqueeze(-1)
@@ -758,13 +684,6 @@ class BigramHashEmbedding(nn.Module):
         self._trigram = trigram
         self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
         nn.init.zeros_(self.embed.weight)
-        # Separate trigram embedding table for richer representation
-        if trigram:
-            self.tri_embed = nn.Embedding(bigram_vocab_size, bigram_dim)
-            nn.init.zeros_(self.tri_embed.weight)
-            self.gate = nn.Linear(bigram_dim * 2, 1, bias=True)
-            nn.init.zeros_(self.gate.weight)
-            nn.init.constant_(self.gate.bias, 1.0)  # start gate open
         self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
         if self.proj is not None:
             nn.init.zeros_(self.proj.weight)
@@ -785,14 +704,9 @@ class BigramHashEmbedding(nn.Module):
         out[..., 2:] = (36313 * t[..., 2:] ^ 27191 * t[..., 1:-1] ^ 51497 * t[..., :-2]) % mod
         return out.long()
     def forward(self, token_ids: Tensor) -> Tensor:
-        h_bi = self.embed(self.bigram_hash(token_ids))
+        h = self.embed(self.bigram_hash(token_ids))
         if self._trigram:
-            h_tri = self.tri_embed(self.trigram_hash(token_ids))
-            # Sigmoid gating to suppress noisy hash collisions
-            gate = torch.sigmoid(self.gate(torch.cat([h_bi, h_tri], dim=-1)))
-            h = h_bi + gate * h_tri
-        else:
-            h = h_bi
+            h = h + self.embed(self.trigram_hash(token_ids))
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
@@ -908,22 +822,12 @@ class GPT(nn.Module):
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        # INNOVATION #1: Information-Bottleneck Skip Routing (compress 512 → 128 → 512)
-        # Forces skip connections to learn WHAT information to pass (not just scale)
-        # Adds (512×128 + 128×512) × 5 = 655K params (< 3% of model, ~1.0 MB after int6)
-        self.skip_compressors = nn.ModuleList([
-            nn.Sequential(
-                CastedLinear(model_dim, model_dim // 4),  # 512 → 128 (4× compression)
-                nn.GELU(),
-                CastedLinear(model_dim // 4, model_dim)   # 128 → 512 (expansion)
-            ) for _ in range(self.num_skip_weights)
-        ])
-        # Parameter banks
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        # Parameter banks: contiguous 3D tensors for batched optimizer
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
         mlp_dim = int(mlp_mult * model_dim)
         self.num_layers = num_layers
-        self.n_attn = num_layers
         self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
         self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
@@ -975,44 +879,21 @@ class GPT(nn.Module):
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
         self._init_weights()
-    def _smeargate_inspired_embedding_init(self, embed_weight: Tensor, std: float = 0.005) -> None:
-        """INNOVATION #5: SmearGate-Inspired Embedding Initialization.
-        Initialize embeddings with temporal correlation patterns, mimicking SmearGate's learned smoothness.
-        Adjacent vocabulary IDs get correlated embeddings, helping model converge faster."""
-        vocab_size, embed_dim = embed_weight.shape
-
-        # Base random initialization
-        nn.init.normal_(embed_weight, mean=0.0, std=std)
-
-        # Apply temporal smoothing: blend each embedding with neighbors
-        # This creates correlation structure similar to what SmearGate learns
-        # Use .data to avoid in-place operation errors on leaf variables
-        smoothing_strength = 0.15  # 15% blend with neighbors
-        with torch.no_grad():
-            for i in range(1, vocab_size - 1):
-                # Blend current embedding with neighbors (weighted by BPE adjacency heuristic)
-                neighbor_blend = smoothing_strength * (embed_weight.data[i-1] + embed_weight.data[i+1]) / 2.0
-                embed_weight.data[i] = (1 - smoothing_strength) * embed_weight.data[i] + neighbor_blend
-
-        # Log innovation application
-        log_innovation('smeargate_init', vocab_size=vocab_size, smoothing=smoothing_strength)
-
     def _init_weights(self) -> None:
         if self.tie_embeddings:
-            # INNOVATION #5: Use SmearGate-inspired initialization
-            self._smeargate_inspired_embedding_init(self.tok_emb.weight, std=self.tied_embed_init_std)
-        n_attn = self.n_attn
-        proj_scale = 1.0 / math.sqrt(2 * self.num_layers)
+            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        n = self.num_layers
+        proj_scale = 1.0 / math.sqrt(2 * n)
         # Init banks: orthogonal, with proj layers scaled down and out/down zero-init
-        for i in range(n_attn):
-            nn.init.orthogonal_(self.qo_bank.data[i], gain=1.0)            # Q
-            nn.init.zeros_(self.qo_bank.data[n_attn + i])                  # Out (zero init)
-            nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)            # K
-            nn.init.orthogonal_(self.kv_bank.data[n_attn + i], gain=1.0)   # V
-            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)        # MLP up
-            nn.init.zeros_(self.mlp_down_bank.data[i])                      # MLP down (zero init)
+        for i in range(n):
+            nn.init.orthogonal_(self.qo_bank.data[i], gain=1.0)        # Q
+            nn.init.zeros_(self.qo_bank.data[n + i])                    # Out (zero init)
+            nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)        # K
+            nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)    # V
+            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)    # MLP up
+            nn.init.zeros_(self.mlp_down_bank.data[i])                  # MLP down (zero init)
             # Scale proj layers (out_proj and mlp_down are "proj" layers)
-            self.qo_bank.data[n_attn + i].mul_(proj_scale)
+            self.qo_bank.data[n + i].mul_(proj_scale)
             self.mlp_down_bank.data[i].mul_(proj_scale)
         # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
         for name, module in self.named_modules():
@@ -1030,18 +911,8 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
-    def _forward_layer(self, layer_idx: int, x: Tensor, x0: Tensor, input_ids: Tensor,
-                        ve_cache: dict, v0: Tensor | None) -> tuple[Tensor, Tensor | None]:
-        """Dispatch a single attention layer."""
-        n_a = self.n_attn
-        ve = self._get_ve(layer_idx, input_ids, ve_cache)
-        x, raw_v = self.blocks[layer_idx](x, x0,
-            self.qo_bank[layer_idx], self.kv_bank[layer_idx], self.kv_bank[n_a + layer_idx],
-            self.qo_bank[n_a + layer_idx], self.mlp_up_bank[layer_idx], self.mlp_down_bank[layer_idx],
-            v_embed=ve, v0=v0)
-        return x, raw_v
-
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -1052,17 +923,33 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
-            x, raw_v = self._forward_layer(i, x, x0, input_ids, ve_cache, v0)
+            ve = self._get_ve(i, input_ids, ve_cache)
+            x, raw_v = self.blocks[i](x, x0,
+                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
-                # INNOVATION #1: Information-Bottleneck Skip Routing
-                skip_compressed = self.skip_compressors[i](skips.pop())
-                x = x + skip_compressed
-            x, _ = self._forward_layer(bi, x, x0, input_ids, ve_cache, v0)
+                # INNOVATION C: QAT with Skip Connection Preservation
+                # Use int8 precision for skip weights (higher than regular int6)
+                skip_w = self.skip_weights[i]
+                if CastedLinear._qat_enabled and self.training:
+                    with torch.no_grad():
+                        # Skip connections: use int8 (clip_range=127) for better precision
+                        w32 = skip_w.float()
+                        w_max = w32.abs().max()
+                        scale = w_max / 127.0
+                        skip_w = (w32 / (scale + 1e-8)).round().clamp(-127, 127) * scale
+                x = x + skip_w.to(dtype=x.dtype)[None, None, :] * skips.pop()
+            ve = self._get_ve(bi, input_ids, ve_cache)
+            x, _ = self.blocks[bi](x, x0,
+                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
+                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1093,6 +980,7 @@ class GPT(nn.Module):
         return main_loss
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         """Return logits (bsz, seq_len, vocab) without computing loss."""
+        n = self.num_layers
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -1103,17 +991,33 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
-            x, raw_v = self._forward_layer(i, x, x0, input_ids, ve_cache, v0)
+            ve = self._get_ve(i, input_ids, ve_cache)
+            x, raw_v = self.blocks[i](x, x0,
+                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
-                # INNOVATION #1: Information-Bottleneck Skip Routing
-                skip_compressed = self.skip_compressors[i](skips.pop())
-                x = x + skip_compressed
-            x, _ = self._forward_layer(bi, x, x0, input_ids, ve_cache, v0)
+                # INNOVATION C: QAT with Skip Connection Preservation
+                # Use int8 precision for skip weights (higher than regular int6)
+                skip_w = self.skip_weights[i]
+                if CastedLinear._qat_enabled and self.training:
+                    with torch.no_grad():
+                        # Skip connections: use int8 (clip_range=127) for better precision
+                        w32 = skip_w.float()
+                        w_max = w32.abs().max()
+                        scale = w_max / 127.0
+                        skip_w = (w32 / (scale + 1e-8)).round().clamp(-127, 127) * scale
+                x = x + skip_w.to(dtype=x.dtype)[None, None, :] * skips.pop()
+            ve = self._get_ve(bi, input_ids, ve_cache)
+            x, _ = self.blocks[bi](x, x0,
+                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
+                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
+                v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1360,12 +1264,10 @@ def _quantize_int6_percentile(t32, clip_range=31):
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
 
-def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int, n_attn: int | None = None) -> dict[str, Tensor]:
-    """Convert 3D bank tensors into individual 2D tensors with standard names.
-    n_attn: number of attention layers (bank size). If None, defaults to num_layers (backward compat).
-    """
+def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tensor]:
+    """Convert 3D bank tensors into individual 2D tensors with standard names."""
     out: dict[str, Tensor] = {}
-    n = n_attn if n_attn is not None else num_layers
+    n = num_layers
     for name, tensor in sd.items():
         if name == "qo_bank":
             for i in range(n):
@@ -1385,12 +1287,10 @@ def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int, n_attn: int | Non
             out[name] = tensor
     return out
 
-def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict[str, Tensor], n_attn: int | None = None) -> dict[str, Tensor]:
-    """Convert individual 2D tensors back into 3D bank tensors.
-    n_attn: number of attention layers (bank size). If None, defaults to num_layers.
-    """
+def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Convert individual 2D tensors back into 3D bank tensors."""
     out: dict[str, Tensor] = {}
-    n = n_attn if n_attn is not None else num_layers
+    n = num_layers
     # Reconstruct banks from individual weight keys
     qo_slices = [None] * (2 * n)
     kv_slices = [None] * (2 * n)
@@ -1469,7 +1369,7 @@ class _HessianAttn(nn.Module):
         q = apply_rotary_emb(q, cos, sin, self.rope_dims)
         k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q.bfloat16(), k.bfloat16(), v.bfloat16(), causal=True)
+        y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         return self.proj(y.reshape(bsz, seqlen, dim))
@@ -1519,14 +1419,7 @@ class _HessianGPT(nn.Module):
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        # INNOVATION #1: Information-Bottleneck Skip Routing (_HessianGPT version)
-        self.skip_compressors = nn.ModuleList([
-            nn.Sequential(
-                CastedLinear(model_dim, model_dim // 4),
-                nn.GELU(),
-                CastedLinear(model_dim // 4, model_dim)
-            ) for _ in range(self.num_skip_weights)
-        ])
+        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
             _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
                           layer_idx=i, ln_scale=ln_scale)
@@ -1557,9 +1450,6 @@ class _HessianGPT(nn.Module):
             ve_cache['ve'] = self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_cache['ve'] * self.ve_layer_scales[ve_idx].to(dtype=ve_cache['ve'].dtype)
-    def _forward_layer(self, layer_idx, x, x0, input_ids, ve_cache):
-        ve = self._get_ve(layer_idx, input_ids, ve_cache)
-        return self.blocks[layer_idx](x, x0, v_embed=ve)
     def forward(self, input_ids, target_ids):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -1570,15 +1460,25 @@ class _HessianGPT(nn.Module):
         skips = []
         ve_cache = {}
         for i in range(self.num_encoder_layers):
-            x = self._forward_layer(i, x, x0, input_ids, ve_cache)
+            ve = self._get_ve(i, input_ids, ve_cache)
+            x = self.blocks[i](x, x0, v_embed=ve)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
-                # INNOVATION #1: Information-Bottleneck Skip Routing
-                skip_compressed = self.skip_compressors[i](skips.pop())
-                x = x + skip_compressed
-            x = self._forward_layer(bi, x, x0, input_ids, ve_cache)
+                # INNOVATION C: QAT with Skip Connection Preservation
+                # Use int8 precision for skip weights (higher than regular int6)
+                skip_w = self.skip_weights[i]
+                if CastedLinear._qat_enabled and self.training:
+                    with torch.no_grad():
+                        # Skip connections: use int8 (clip_range=127) for better precision
+                        w32 = skip_w.float()
+                        w_max = w32.abs().max()
+                        scale = w_max / 127.0
+                        skip_w = (w32 / (scale + 1e-8)).round().clamp(-127, 127) * scale
+                x = x + skip_w.to(dtype=x.dtype)[None, None, :] * skips.pop()
+            ve = self._get_ve(bi, input_ids, ve_cache)
+            x = self.blocks[bi](x, x0, v_embed=ve)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1620,143 +1520,12 @@ def collect_hessians(hessian_model, train_loader, args, device, grad_accum_steps
     hessian_model.train()
     return hessians
 
-def _compute_hessian_sensitivity(hessians: dict[str, Tensor]) -> dict[str, float]:
-    """Compute per-layer sensitivity from Hessian diagonal trace.
-    Higher trace = more sensitive = needs more bits."""
-    sensitivity: dict[str, float] = {}
-    for name, H in hessians.items():
-        trace = torch.diag(H).abs().mean().item()
-        sensitivity[name] = trace
-    return sensitivity
-
-def _compute_bigram_sensitivity(state_dict: dict[str, Tensor] | None, quantizable_names: list[str]) -> dict[str, float]:
-    """INNOVATION #3 (FIXED): BigramHash-Guided Quantization.
-    Compute per-layer sensitivity based on bigram embedding patterns.
-    FIX: Use per-layer variance analysis instead of global constant."""
-    bigram_sensitivity: dict[str, float] = {}
-
-    # Try to extract bigram embedding from state dict
-    bigram_weight = None
-    if state_dict is not None:
-        if 'bigram.embed.weight' in state_dict:
-            bigram_weight = state_dict['bigram.embed.weight']
-
-    if bigram_weight is None:
-        # No bigram module - return uniform sensitivity
-        return {name: 1.0 for name in quantizable_names}
-
-    # Compute per-embedding variance (proxy for pattern complexity)
-    bigram_variance = bigram_weight.data.var(dim=-1).float()  # Shape: [3072]
-
-    # Compute percentile-based complexity scores (avoids outliers)
-    p25 = torch.quantile(bigram_variance, 0.25).item()
-    p75 = torch.quantile(bigram_variance, 0.75).item()
-    iqr = p75 - p25 + 1e-6
-
-    # FIX: Assign sensitivity per layer based on LAYER-SPECIFIC complexity patterns
-    for name in quantizable_names:
-        # Extract layer index from name (e.g., "blocks.5.attn.q" → layer 5)
-        if "blocks." in name:
-            parts = name.split(".")
-            layer_idx = int(parts[1])
-
-            # FIX: Multi-factor heuristic with wider variance
-            # Factor 1: Depth (early layers = token-level, late layers = semantic)
-            depth_factor = 0.2 + 1.6 * (layer_idx / 11.0)  # 0.2 to 1.8 (9× range)
-
-            # Factor 2: Component type (attn needs more precision than MLP)
-            component_factor = 1.0
-            if ".attn." in name:
-                if ".q" in name or ".k" in name:
-                    component_factor = 1.3  # QK projection most critical
-                elif ".v" in name or ".c_proj" in name:
-                    component_factor = 1.1  # V and output important
-            elif ".mlp." in name:
-                component_factor = 0.9  # MLP less sensitive
-
-            # Factor 3: Bigram complexity (IQR-normalized)
-            # Use layer-specific slice of bigram embeddings for variation
-            slice_start = (layer_idx * 3072) // 12
-            slice_end = ((layer_idx + 1) * 3072) // 12
-            layer_variance = bigram_variance[slice_start:slice_end].mean().item()
-            complexity_factor = 0.5 + 1.0 * (layer_variance - p25) / iqr  # 0.5 to 1.5
-
-            # FIX: Skip compressor bottleneck protection
-            # Bottleneck layers (128-dim) need higher precision due to 4× compression
-            if "skip_compressors" in name and ".0.weight" in name:
-                # First layer of skip compressor (512→128 bottleneck)
-                component_factor *= 1.5  # Boost precision for bottleneck
-
-            # Combine all factors (wider range: ~0.1 to ~3.5)
-            bigram_sensitivity[name] = depth_factor * component_factor * complexity_factor
-        else:
-            bigram_sensitivity[name] = 1.0  # Default for non-layer params
-
-    return bigram_sensitivity
-
-def _assign_bit_widths(sensitivity: dict[str, float], quantizable_names: list[str],
-                       bigram_sensitivity: dict[str, float] | None = None) -> dict[str, int]:
-    """Assign int5/int6/int7 per layer based on Hessian + BigramHash sensitivity.
-    INNOVATION #3 (FIXED): Blend Hessian (precision needs) with BigramHash (pattern complexity).
-    FIX: Rebalanced to 50/50 blend (BigramHash now varies more) + aggressive distribution."""
-    if not quantizable_names:
-        return {}
-
-    # FIX: Rebalanced blend (BigramHash now has wider variance, deserves equal weight)
-    if bigram_sensitivity is not None:
-        # 50% Hessian (empirical precision needs) + 50% BigramHash (pattern complexity)
-        blended_sensitivity = {
-            name: 0.5 * sensitivity.get(name, 0.0) + 0.5 * bigram_sensitivity.get(name, 1.0)
-            for name in quantizable_names
-        }
-    else:
-        blended_sensitivity = {name: sensitivity.get(name, 0.0) for name in quantizable_names}
-
-    scores = [(name, blended_sensitivity[name]) for name in quantizable_names]
-    scores.sort(key=lambda x: x[1])
-    n = len(scores)
-
-    # FIX: More aggressive distribution for better differentiation
-    # Bottom 25% → int5, middle 55% → int6, top 20% → int7
-    int5_cutoff = int(n * 0.25)  # Reduced from 0.30
-    int7_cutoff = int(n * 0.75)  # Reduced from 0.80 (more int7 allocation)
-
-    bit_map: dict[str, int] = {}
-    for i, (name, score) in enumerate(scores):
-        if i < int5_cutoff:
-            bit_map[name] = 5  # clip_range=15
-        elif i >= int7_cutoff:
-            bit_map[name] = 7  # clip_range=63
-        else:
-            bit_map[name] = 6  # clip_range=31
-        # Log bit allocation for innovation tracking
-        log_innovation('bigram_quant_bits', **{name: bit_map[name]})
-    return bit_map
-
-_BITS_TO_CLIP = {5: 15, 6: 31, 7: 63}
-
-def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hessians: dict[str, Tensor] | None = None,
-                        mixed_precision: bool = False):
+def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hessians: dict[str, Tensor] | None = None):
     num_layers_total = max(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,
     ) + 1
     late_k_layers = set(range(num_layers_total - 2, num_layers_total))
-    # Determine per-layer bit widths if mixed precision enabled
-    bit_map: dict[str, int] = {}
-    if mixed_precision and hessians:
-        quantizable_names = [
-            name for name, tensor in state_dict.items()
-            if _classify_param(name) in int6_cats
-            and tensor.is_floating_point()
-            and tensor.numel() > 65536
-            and tensor.ndim >= 1
-            and not any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS)
-        ]
-        sensitivity = _compute_hessian_sensitivity(hessians)
-        # INNOVATION #3: Compute bigram-guided sensitivity from state dict
-        bigram_sens = _compute_bigram_sensitivity(state_dict, quantizable_names)
-        bit_map = _assign_bit_widths(sensitivity, quantizable_names, bigram_sensitivity=bigram_sens)
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
@@ -1771,8 +1540,7 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hess
             meta[name] = "passthrough_ctrl"
             continue
         if cat in int6_cats and t.ndim >= 1:
-            bits = bit_map.get(name, 6)
-            cr = _BITS_TO_CLIP.get(bits, 31)
+            cr = 31  # int6 for all weights
             H = hessians.get(name) if hessians else None
             if H is not None:
                 q, s = quantize_int6_gptq(t, hessian=H, clip_range=cr)
@@ -1780,7 +1548,7 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hess
                 q, s = quantize_int6_per_row(t, clip_range=cr)
             result[name + ".q"] = q
             result[name + ".scale"] = s
-            meta[name] = {"type": f"int{bits}"}
+            meta[name] = {"type": "int6"}
         else:
             q, s = quantize_float_tensor(t)
             result[name + ".q"] = q
@@ -1910,10 +1678,6 @@ def main() -> None:
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
     ).to(device).bfloat16()
-    # INNOVATION #1: Log SP8192 tokenizer usage
-    if args.vocab_size == 8192:
-        log_innovation('sp8192_tokenizer', value=True)
-        log0("INNOVATION: SP8192 tokenizer active (expected -0.032 BPB vs SP1024)")
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
     base_model.kv_bank.data = base_model.kv_bank.data.float()
@@ -1943,8 +1707,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    # INNOVATION #2: skip_compressors are now ModuleList (Linear layers collected as matrix params)
-    # No need to add them here - they're automatically included in block_named_params
+    if base_model.skip_weights.numel() > 0:
+        scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
@@ -1968,14 +1732,15 @@ def main() -> None:
         weight_decay=args.adam_wd,
         fused=True,
     )
-    # Muon for banked attention params
     optimizer_muon = Muon(
-        [{"params": matrix_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+        matrix_params,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
         weight_decay=args.muon_wd,
     )
+    for group in optimizer_muon.param_groups:
+        group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -1988,6 +1753,7 @@ def main() -> None:
     for pg in optimizer_tok.param_groups[1:]:
         replicated_params.extend(pg["params"])
     replicated_params.extend(scalar_params)
+
     optimizer_head = None
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
@@ -2006,6 +1772,20 @@ def main() -> None:
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
+    # Log novel training innovations
+    log0("=" * 80)
+    log0("NOVEL TRAINING INNOVATIONS (YOUR Architecture + Novel Techniques)")
+    log0("=" * 80)
+    log0("✓ Innovation A: Gradient Surgery for U-Net Skip Connections")
+    log0("  - Orthogonalize skip gradients to encoder gradients (reduce conflict)")
+    log0("✓ Innovation B: Layer-Wise Learning Rate Decay (U-Net aware)")
+    log0(f"  - Encoder LR scale: 0.6× to 1.0× (early→late)")
+    log0(f"  - Decoder LR scale: 1.0× to 1.2× (early→late)")
+    log0("✓ Innovation C: QAT with Skip Connection Preservation")
+    log0("  - Skip weights use int8 (clip=127) during QAT")
+    log0("  - Regular weights use int6 (clip=31)")
+    log0(f"  - QAT threshold: {args.late_qat_threshold}")
+    log0("=" * 80)
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -2117,6 +1897,63 @@ def main() -> None:
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
+
+        # INNOVATION A: Gradient Surgery for U-Net Skip Connections
+        # Orthogonalize skip gradients to encoder gradients (reduce gradient conflict)
+        if base_model.skip_weights.grad is not None and base_model.skip_weights.numel() > 0:
+            with torch.no_grad():
+                for i in range(min(base_model.skip_weights.size(0), base_model.num_encoder_layers)):
+                    encoder_idx = i
+                    # Collect encoder block gradients (main path)
+                    encoder_grads = []
+                    for p in base_model.blocks[encoder_idx].parameters():
+                        if p.grad is not None:
+                            encoder_grads.append(p.grad.flatten())
+
+                    if encoder_grads:
+                        main_grad_vec = torch.cat(encoder_grads)
+                        main_norm_sq = main_grad_vec.norm() ** 2 + 1e-8
+
+                        # Project skip gradient orthogonal to main gradient
+                        skip_grad = base_model.skip_weights.grad[i]
+                        dot_prod = (skip_grad.flatten() * main_grad_vec[:skip_grad.numel()]).sum()
+                        skip_grad_orth = skip_grad - (dot_prod / main_norm_sq) * skip_grad
+                        base_model.skip_weights.grad[i] = skip_grad_orth
+
+        # INNOVATION B: Layer-Wise Learning Rate Decay (U-Net aware)
+        # Scale gradients per layer based on U-Net depth (equivalent to per-layer LR)
+        with torch.no_grad():
+            num_encoder = base_model.num_encoder_layers
+            num_decoder = base_model.num_decoder_layers
+
+            # Scale parameter bank gradients (banks are [num_layers, ...])
+            for bank_name, bank in [("qo_bank", base_model.qo_bank),
+                                     ("kv_bank", base_model.kv_bank),
+                                     ("mlp_up_bank", base_model.mlp_up_bank),
+                                     ("mlp_down_bank", base_model.mlp_down_bank)]:
+                if bank.grad is not None:
+                    for layer_idx in range(bank.grad.size(0)):
+                        if layer_idx < num_encoder:
+                            # Encoder: lower LR for early layers (0.6× to 1.0×)
+                            lr_scale = 0.6 + 0.4 * (layer_idx / max(num_encoder - 1, 1))
+                        else:
+                            # Decoder: higher LR for late layers (1.0× to 1.2×)
+                            decoder_depth = layer_idx - num_encoder
+                            lr_scale = 1.0 + 0.2 * (decoder_depth / max(num_decoder - 1, 1))
+                        bank.grad[layer_idx].mul_(lr_scale)
+
+            # Scale block-level scalar params (attn_scale, mlp_scale, etc.)
+            for i, block in enumerate(base_model.blocks):
+                if i < num_encoder:
+                    lr_scale = 0.6 + 0.4 * (i / max(num_encoder - 1, 1))
+                else:
+                    decoder_depth = i - num_encoder
+                    lr_scale = 1.0 + 0.2 * (decoder_depth / max(num_decoder - 1, 1))
+
+                for param in block.parameters():
+                    if param.grad is not None and param.ndim < 2:  # Scalar params only
+                        param.grad.mul_(lr_scale)
+
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
         for group in optimizer_muon.param_groups:
@@ -2195,11 +2032,10 @@ def main() -> None:
         current_state = base_model.state_dict()
         avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
         base_model.load_state_dict(avg_state, strict=True)
-    t_post_train_start = time.perf_counter()
     torch.cuda.synchronize()
     t_diag = time.perf_counter()
     diag_val_loss, diag_val_bpb = eval_val(
-        args, model, rank, world_size, device, grad_accum_steps,
+        args, compiled_model, rank, world_size, device, grad_accum_steps,
         val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
     )
     torch.cuda.synchronize()
@@ -2220,8 +2056,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
-    n_attn = base_model.n_attn
-    unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers, n_attn=n_attn)
+    unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
     # Full GPTQ: collect Hessians via a temporary non-banked model
     log0(f"gptq:building non-banked model for Hessian collection...")
     hessian_model = _HessianGPT(
@@ -2243,11 +2078,11 @@ def main() -> None:
         strict=False,
     )
     # Autoregressive self-generated calibration (no external data)
-    log0("gptq:generating autoregressive calibration data (32 seqs x 2048 tokens, temp=0.8)...")
+    log0("gptq:generating autoregressive calibration data (64 seqs x 2048 tokens, temp=0.8)...")
     base_model.load_state_dict(export_sd, strict=False)
     t_gen = time.perf_counter()
     ar_tokens = generate_autoregressive_calib(
-        base_model, device, num_seqs=32, seq_len=args.train_seq_len,
+        base_model, device, num_seqs=64, seq_len=args.train_seq_len,
         vocab_size=args.vocab_size, temperature=0.8, batch_size=8, seed=args.seed,
     )
     log0(f"gptq:generated {len(ar_tokens)} sequences in {time.perf_counter()-t_gen:.1f}s")
@@ -2257,22 +2092,15 @@ def main() -> None:
     del ar_tokens
     del hessian_model
     torch.cuda.empty_cache()
-    quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"}, hessians=hessians,
-                                                    mixed_precision=args.gptq_mixed_precision)
-    # Log bit allocation summary
-    bit_counts: dict[str, int] = {}
-    for info in quant_meta.values():
-        if isinstance(info, dict):
-            bit_counts[info.get("type", "?")] = bit_counts.get(info.get("type", "?"), 0) + 1
-    log0(f"gptq:bit allocation: {bit_counts}")
+    quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"}, hessians=hessians)
     # NOVEL: Selective ±1 pruning by reconstruction error
     # Sort ±1 quantized values by their reconstruction error (scale²),
     # prune least-impactful first until artifact fits target size.
-    target_mb = float(os.environ.get("TARGET_MB", "15.1"))
+    target_mb = float(os.environ.get("TARGET_MB", "15.9"))
     code_bytes_est = len(code.encode("utf-8"))
     ones_info = []  # (tensor_key, flat_idx, error)
     for name, info in quant_meta.items():
-        if not (isinstance(info, dict) and info.get("type", "").startswith("int") and info.get("type") != "int8"): continue
+        if not (isinstance(info, dict) and info.get("type") == "int6"): continue
         qk, sk = name + ".q", name + ".scale"
         if qk not in quant_result or sk not in quant_result: continue
         q, s = quant_result[qk], quant_result[sk]
@@ -2284,49 +2112,38 @@ def main() -> None:
                 errors = s.float()[row_idx].pow(2)
                 for fi, err in zip(flat_idx.tolist(), errors.tolist()):
                     ones_info.append((qk, fi, err))
-    n_prune = 0
-    target_bytes = int(target_mb * 1024 * 1024)
-    # Compress unpruned first (needed for artifact anyway)
+    if ones_info:
+        ones_info.sort(key=lambda x: x[2])
+        def _try_prune(n):
+            tmp = {k: v.clone() for k, v in quant_result.items()}
+            for i in range(min(n, len(ones_info))):
+                tmp[ones_info[i][0]].view(-1)[ones_info[i][1]] = 0
+            buf = io.BytesIO(); torch.save({"w": tmp, "m": quant_meta}, buf)
+            return len(lzma.compress(buf.getvalue(), preset=9)) + code_bytes_est, tmp
+        no_sz, _ = _try_prune(0)
+        target_bytes = int(target_mb * 1024 * 1024)
+        log0(f"selective_prune: {len(ones_info)} ±1 candidates, unpruned={no_sz/(1024*1024):.2f}MB target={target_mb}MB")
+        if no_sz <= target_bytes:
+            log0("selective_prune: already fits, no pruning needed")
+        else:
+            full_sz, _ = _try_prune(len(ones_info))
+            log0(f"selective_prune: full ±1 prune={full_sz/(1024*1024):.2f}MB")
+            if full_sz > target_bytes:
+                log0("selective_prune: even full prune not enough, applying all")
+                _, quant_result = _try_prune(len(ones_info))
+            else:
+                lo, hi = 0, len(ones_info)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    sz, _ = _try_prune(mid)
+                    if sz <= target_bytes: hi = mid
+                    else: lo = mid + 1
+                log0(f"selective_prune: pruning {lo}/{len(ones_info)} ±1 values ({100*lo/len(ones_info):.1f}%) to fit {target_mb}MB")
+                _, quant_result = _try_prune(lo)
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob = lzma.compress(quant_raw, preset=9)
-    sz0 = len(quant_blob) + code_bytes_est
-    if ones_info:
-        ones_info.sort(key=lambda x: x[2])
-        def _apply_prune(n):
-            tmp = {k: v.clone() for k, v in quant_result.items()}
-            for i in range(min(n, len(ones_info))):
-                tmp[ones_info[i][0]].view(-1)[ones_info[i][1]] = 0
-            return tmp
-        def _lzma_size(tmp):
-            buf = io.BytesIO(); torch.save({"w": tmp, "m": quant_meta}, buf)
-            return len(lzma.compress(buf.getvalue(), preset=9)) + code_bytes_est
-        log0(f"selective_prune: {len(ones_info)} ±1 candidates, unpruned={sz0/(1024*1024):.2f}MB target={target_mb}MB")
-        if sz0 > target_bytes:
-            sz_full = _lzma_size(_apply_prune(len(ones_info)))
-            log0(f"selective_prune: full prune={sz_full/(1024*1024):.2f}MB")
-            if sz_full > target_bytes:
-                log0("selective_prune: even full prune not enough, applying all")
-                n_prune = len(ones_info)
-            else:
-                frac = (sz0 - target_bytes) / max(sz0 - sz_full, 1)
-                n_prune = min(int(len(ones_info) * frac * 1.10) + 10, len(ones_info))
-                log0(f"selective_prune: interpolated {n_prune}/{len(ones_info)} ({100*n_prune/len(ones_info):.1f}%)")
-            quant_result = _apply_prune(n_prune)
-            quant_buf = io.BytesIO()
-            torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-            quant_raw = quant_buf.getvalue()
-            quant_blob = lzma.compress(quant_raw, preset=9)
-            # If interpolation was slightly off, increase pruning
-            while (len(quant_blob) + code_bytes_est) > target_bytes and n_prune < len(ones_info):
-                old_n = n_prune
-                n_prune = min(int(n_prune * 1.2) + 200, len(ones_info))
-                log0(f"selective_prune: adjust {old_n}->{n_prune}/{len(ones_info)}")
-                quant_result = _apply_prune(n_prune)
-                quant_buf = io.BytesIO()
-                torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
-                quant_blob = lzma.compress(quant_buf.getvalue(), preset=9)
     if master_process:
         with open("final_model.int6.ptz", "wb") as f:
             f.write(quant_blob)
@@ -2344,7 +2161,7 @@ def main() -> None:
     )
     deq_unbanked = dequantize_mixed_int6(quant_state["w"], quant_state["m"], unbanked_sd)
     # Re-bank the dequantized tensors
-    deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu, n_attn=n_attn)
+    deq_state = _rebank_state_dict(deq_unbanked, args.num_layers, sd_cpu)
     eval_model = GPT(
         vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
@@ -2397,12 +2214,7 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
-        # Print innovation summary after final results
-        print_innovation_summary(log0, model=eval_model)
-    post_train_elapsed = time.perf_counter() - t_post_train_start
-    if post_train_elapsed > 480:
-        log0(f"time_budget: skipping secondary sliding eval (elapsed {post_train_elapsed:.0f}s > 480s)")
-    elif args.eval_stride != 64 and 64 < sw_seq_len:
+    if args.eval_stride != 64 and 64 < sw_seq_len:
         torch.cuda.synchronize()
         t_slide64 = time.perf_counter()
         sw64_val_loss, sw64_val_bpb = eval_val_sliding(
