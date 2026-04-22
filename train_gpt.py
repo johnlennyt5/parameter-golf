@@ -46,8 +46,8 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 10))  # Reduced from 11 (BATTLE_PLAN Change 6)
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
+    num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -845,15 +845,6 @@ class GPT(nn.Module):
         mlp_dim = int(mlp_mult * model_dim)
         self.num_layers = num_layers
         self.n_attn = num_layers
-
-        # Mixture-of-Depths recurrence configuration (BATTLE_PLAN Change 2)
-        self.recurrence_config = {
-            2: 2,  # Layer 2: loop 2×
-            3: 3,  # Layer 3: loop 3× (novel)
-            4: 3,  # Layer 4: loop 3× (novel)
-            5: 2,  # Layer 5: loop 2×
-        }
-        self.current_loop_iter = 0  # Track which loop iteration we're in
         self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
         self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
@@ -958,19 +949,10 @@ class GPT(nn.Module):
         v0 = None
         skips: list[Tensor] = []
         ve_cache: dict = {}
-        # MoD forward pass with variable recurrence (BATTLE_PLAN Change 3)
         for i in range(self.num_encoder_layers):
-            if i in self.recurrence_config:
-                loop_count = self.recurrence_config[i]
-                for loop_iter in range(loop_count):
-                    self.current_loop_iter = loop_iter
-                    x, raw_v = self._forward_layer(i, x, x0, input_ids, ve_cache, v0)
-                    if v0 is None and raw_v is not None:
-                        v0 = raw_v
-            else:
-                x, raw_v = self._forward_layer(i, x, x0, input_ids, ve_cache, v0)
-                if v0 is None and raw_v is not None:
-                    v0 = raw_v
+            x, raw_v = self._forward_layer(i, x, x0, input_ids, ve_cache, v0)
+            if v0 is None and raw_v is not None:
+                v0 = raw_v
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -1016,19 +998,10 @@ class GPT(nn.Module):
         v0 = None
         skips: list[Tensor] = []
         ve_cache: dict = {}
-        # MoD forward pass with variable recurrence (BATTLE_PLAN Change 3)
         for i in range(self.num_encoder_layers):
-            if i in self.recurrence_config:
-                loop_count = self.recurrence_config[i]
-                for loop_iter in range(loop_count):
-                    self.current_loop_iter = loop_iter
-                    x, raw_v = self._forward_layer(i, x, x0, input_ids, ve_cache, v0)
-                    if v0 is None and raw_v is not None:
-                        v0 = raw_v
-            else:
-                x, raw_v = self._forward_layer(i, x, x0, input_ids, ve_cache, v0)
-                if v0 is None and raw_v is not None:
-                    v0 = raw_v
+            x, raw_v = self._forward_layer(i, x, x0, input_ids, ve_cache, v0)
+            if v0 is None and raw_v is not None:
+                v0 = raw_v
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -1564,58 +1537,8 @@ def _assign_bit_widths(sensitivity: dict[str, float], quantizable_names: list[st
 
 _BITS_TO_CLIP = {5: 15, 6: 31, 7: 63}
 
-def recurrence_aware_bit_allocation(state_dict: dict[str, Tensor], recurrence_config: dict[int, int] | None = None) -> dict[str, int]:
-    """
-    Assign bit widths based on recurrence depth + Option A artifact mitigation.
-    (BATTLE_PLAN Change 5)
-
-    Recurrence-aware allocation:
-    - Layers with 3× recurrence: int8 (most critical)
-    - Layers with 2× recurrence: int7
-    - Non-recurrent layers: int6
-
-    Option A mitigation (int5 on select layers to save space):
-    - Layers 0-1: int5 (early features)
-    - Layers 6-7: int5 (mid layers)
-    """
-    bit_allocation: dict[str, int] = {}
-
-    # Default recurrence config if not provided
-    if recurrence_config is None:
-        recurrence_config = {2: 2, 3: 3, 4: 3, 5: 2}
-
-    # Determine number of layers
-    num_layers = max(
-        (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
-        default=10,
-    ) + 1
-
-    for layer_idx in range(num_layers):
-        # Recurrence-aware allocation
-        if layer_idx in recurrence_config:
-            loop_count = recurrence_config[layer_idx]
-            if loop_count >= 3:
-                bits = 8  # int8 for 3× recurrence (layers 3-4)
-            elif loop_count == 2:
-                bits = 7  # int7 for 2× recurrence (layers 2, 5)
-            else:
-                bits = 6  # int6 default
-        else:
-            # Option A mitigation: int5 on select non-recurrent layers
-            if layer_idx in {0, 1, 6, 7}:
-                bits = 5  # int5 to save space
-            else:
-                bits = 6  # int6 for normal layers
-
-        # Apply to all weights in this layer
-        for name in state_dict.keys():
-            if f'blocks.{layer_idx}.' in name:
-                bit_allocation[name] = bits
-
-    return bit_allocation
-
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hessians: dict[str, Tensor] | None = None,
-                        mixed_precision: bool = False, recurrence_config: dict[int, int] | None = None):
+                        mixed_precision: bool = False):
     num_layers_total = max(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,
@@ -1623,11 +1546,7 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hess
     late_k_layers = set(range(num_layers_total - 2, num_layers_total))
     # Determine per-layer bit widths if mixed precision enabled
     bit_map: dict[str, int] = {}
-
-    # Use recurrence-aware allocation if provided (BATTLE_PLAN Change 5)
-    if recurrence_config is not None:
-        bit_map = recurrence_aware_bit_allocation(state_dict, recurrence_config)
-    elif mixed_precision and hessians:
+    if mixed_precision and hessians:
         quantizable_names = [
             name for name, tensor in state_dict.items()
             if _classify_param(name) in int6_cats
@@ -1980,7 +1899,6 @@ def main() -> None:
                     f"step:{step}/{args.iterations}"
                 )
             break
-
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         if args.late_qat_threshold > 0 and scale < args.late_qat_threshold and not CastedLinear._qat_enabled:
@@ -2136,8 +2054,7 @@ def main() -> None:
     del hessian_model
     torch.cuda.empty_cache()
     quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"}, hessians=hessians,
-                                                    mixed_precision=args.gptq_mixed_precision,
-                                                    recurrence_config=base_model.recurrence_config)
+                                                    mixed_precision=args.gptq_mixed_precision)
     # Log bit allocation summary
     bit_counts: dict[str, int] = {}
     for info in quant_meta.values():
