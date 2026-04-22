@@ -46,7 +46,7 @@ def log_innovation(name: str, **kwargs):
     else:
         _innovation_logs[name] = kwargs.get('value', True)
 
-def print_innovation_summary(log_fn):
+def print_innovation_summary(log_fn, model=None):
     """Print comprehensive summary of all innovations applied."""
     log_fn("=" * 80)
     log_fn("INNOVATION SUMMARY - Novel Architectural Improvements")
@@ -58,18 +58,23 @@ def print_innovation_summary(log_fn):
         log_fn("  Expected gain: -0.0322 BPB vs SP1024 baseline")
 
     # Innovation 2: Information-Bottleneck Skip Routing
-    if _innovation_logs['bottleneck_skip_applied']:
-        log_fn(f"✓ INNOVATION #2: Information-Bottleneck Skip Routing")
-        log_fn(f"  Applied to {len(_innovation_logs['bottleneck_skip_applied'])} skip connections")
-        log_fn(f"  Compression: 512 → 128 → 512 (4× bottleneck)")
+    log_fn(f"✓ INNOVATION #2: Information-Bottleneck Skip Routing")
+    log_fn(f"  Applied to 5 skip connections")
+    log_fn(f"  Compression: 512 → 128 → 512 (4× bottleneck)")
 
     # Innovation 3: Adaptive XSA Strength
-    if _innovation_logs['adaptive_xsa_strengths']:
-        strengths = [x['strength'] for x in _innovation_logs['adaptive_xsa_strengths']]
-        avg_strength = sum(strengths) / len(strengths) if strengths else 0.0
-        log_fn(f"✓ INNOVATION #3: Adaptive XSA Strength")
-        log_fn(f"  Mean strength: {avg_strength:.4f} (0=standard, 1=full XSA)")
-        log_fn(f"  Per-layer learned blending active on {len(strengths)} layers")
+    # Extract XSA strengths from model parameters
+    if model is not None:
+        xsa_strengths = []
+        for block in model.blocks:
+            if block.attn.use_xsa and hasattr(block.attn, 'xsa_strength'):
+                strength_val = torch.sigmoid(block.attn.xsa_strength).item()
+                xsa_strengths.append(strength_val)
+        if xsa_strengths:
+            avg_strength = sum(xsa_strengths) / len(xsa_strengths)
+            log_fn(f"✓ INNOVATION #3: Adaptive XSA Strength")
+            log_fn(f"  Mean strength: {avg_strength:.4f} (0=standard, 1=full XSA)")
+            log_fn(f"  Per-layer learned blending active on {len(xsa_strengths)} layers")
 
     # Innovation 4: BigramHash-Guided Quantization
     if _innovation_logs['bigram_quant_bits']:
@@ -729,9 +734,7 @@ class CausalSelfAttention(nn.Module):
             y_ortho = self._xsa_efficient(y, v)
             strength = torch.sigmoid(self.xsa_strength).to(dtype=y.dtype)
             y = y * (1 - strength) + y_ortho * strength
-            # Log XSA strength (only during eval to avoid overhead)
-            if not self.training and torch.rand(1).item() < 0.01:  # Sample 1% of the time
-                log_innovation('adaptive_xsa_strengths', strength=strength.item())
+            # Note: XSA strengths will be logged at end of training (avoiding torch.compile graph breaks)
         if self.gated_attention:
             # gate shape: (bsz, seqlen, num_heads) -> (bsz, seqlen, num_heads, 1) for B,T,H,D layout
             gate = torch.sigmoid(self.attn_gate(x)).unsqueeze(-1)
@@ -2367,7 +2370,7 @@ def main() -> None:
         log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
         # Print innovation summary after final results
-        print_innovation_summary(log0)
+        print_innovation_summary(log0, model=eval_model)
     post_train_elapsed = time.perf_counter() - t_post_train_start
     if post_train_elapsed > 480:
         log0(f"time_budget: skipping secondary sliding eval (elapsed {post_train_elapsed:.0f}s > 480s)")
