@@ -96,8 +96,8 @@ class Hyperparameters:
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
     # EMA decay (tuned for SP8192)
     ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
-    # Depth recurrence (zero-param optimization)
-    depth_recur_enabled = bool(int(os.environ.get("DEPTH_RECUR_ENABLED", "1")))
+    # Depth recurrence (zero-param optimization) - DISABLED due to torch.compile incompatibility
+    depth_recur_enabled = bool(int(os.environ.get("DEPTH_RECUR_ENABLED", "0")))
     depth_recur_layers = [int(x) for x in os.environ.get("DEPTH_RECUR_LAYERS", "3,4,5").split(",")]
     depth_recur_start_frac = float(os.environ.get("DEPTH_RECUR_START_FRAC", 0.35))
     # Parallel residuals (minimal-param optimization)
