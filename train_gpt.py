@@ -26,10 +26,10 @@ from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from flash_attn_interface import flash_attn_func as flash_attn_3_func
 class Hyperparameters:
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
@@ -42,13 +42,13 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.25))
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 11))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 4.0))
+    mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -56,7 +56,7 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.035))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.022))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.025))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.025))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -75,8 +75,8 @@ class Hyperparameters:
     lawa_enabled = bool(int(os.environ.get("LAWA_ENABLED", "0")))
     lawa_k = int(os.environ.get("LAWA_K", 10))
     lawa_freq = int(os.environ.get("LAWA_FREQ", 100))
-    muon_wd = float(os.environ.get("MUON_WD", 0.095))
-    adam_wd = float(os.environ.get("ADAM_WD", 0.095))
+    muon_wd = float(os.environ.get("MUON_WD", 0.04))
+    adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -86,7 +86,7 @@ class Hyperparameters:
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
-    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
+    ve_enabled = bool(int(os.environ.get("VE_ENABLED", "0")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
@@ -96,6 +96,13 @@ class Hyperparameters:
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
     # EMA decay (tuned for SP8192)
     ema_decay = float(os.environ.get("EMA_DECAY", 0.9965))
+    # Depth recurrence (zero-param optimization)
+    depth_recur_enabled = bool(int(os.environ.get("DEPTH_RECUR_ENABLED", "1")))
+    depth_recur_layers = [int(x) for x in os.environ.get("DEPTH_RECUR_LAYERS", "3,4,5").split(",")]
+    depth_recur_start_frac = float(os.environ.get("DEPTH_RECUR_START_FRAC", 0.35))
+    # Parallel residuals (minimal-param optimization)
+    parallel_resid_enabled = bool(int(os.environ.get("PARALLEL_RESID_ENABLED", "1")))
+    parallel_resid_start_layer = int(os.environ.get("PARALLEL_RESID_START_LAYER", 7))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -752,8 +759,12 @@ class Block(nn.Module):
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
+        parallel_resid_enabled: bool = False,
+        parallel_resid_start_layer: int = 7,
     ):
         super().__init__()
+        self.layer_idx = layer_idx
+        self.parallel_resid = parallel_resid_enabled and layer_idx >= parallel_resid_start_layer
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
@@ -763,6 +774,10 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
+        # Parallel residual weights (learned blend, init 0.5 each)
+        if self.parallel_resid:
+            self.par_attn_weight = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+            self.par_mlp_weight = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
         if dtg:
             self.dtg_gate = nn.Linear(dim, 1, bias=True)
             nn.init.zeros_(self.dtg_gate.weight)
@@ -773,8 +788,18 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+
+        if self.parallel_resid:
+            # Parallel residuals: both attn and mlp read from same input
+            mlp_out = self.mlp(self.mlp_norm(x_in) * self.ln_scale_factor, up_w, down_w)
+            attn_scaled = self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+            mlp_scaled = self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * mlp_out
+            x_out = x_in + self.par_attn_weight * attn_scaled + self.par_mlp_weight * mlp_scaled
+        else:
+            # Sequential residuals (original)
+            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+            x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
             x_out = x_in + gate * (x_out - x_in)
@@ -807,8 +832,17 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        depth_recur_enabled: bool = False,
+        depth_recur_layers: list[int] = None,
+        depth_recur_start_frac: float = 0.35,
+        parallel_resid_enabled: bool = False,
+        parallel_resid_start_layer: int = 7,
     ):
         super().__init__()
+        self.depth_recur_enabled = depth_recur_enabled
+        self.depth_recur_layers = depth_recur_layers or [3, 4, 5]
+        self.depth_recur_start_frac = depth_recur_start_frac
+        self._training_step = 0  # Track for depth recurrence activation
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -848,6 +882,8 @@ class GPT(nn.Module):
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
+                    parallel_resid_enabled=parallel_resid_enabled,
+                    parallel_resid_start_layer=parallel_resid_start_layer,
                 )
                 for i in range(num_layers)
             ]
@@ -926,12 +962,19 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
+            # First pass
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
+            # Depth recurrence: second pass through same layer (weight sharing, zero params)
+            if self.depth_recur_enabled and i in self.depth_recur_layers and self._training_step >= int(20000 * self.depth_recur_start_frac):
+                x, _ = self.blocks[i](x, x0,
+                    self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                    self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                    v_embed=ve, v0=v0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -994,12 +1037,19 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
+            # First pass
             x, raw_v = self.blocks[i](x, x0,
                 self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
                 self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
+            # Depth recurrence: second pass through same layer (weight sharing, zero params)
+            if self.depth_recur_enabled and i in self.depth_recur_layers and self._training_step >= int(20000 * self.depth_recur_start_frac):
+                x, _ = self.blocks[i](x, x0,
+                    self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                    self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
+                    v_embed=ve, v0=v0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -1679,6 +1729,11 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        depth_recur_enabled=args.depth_recur_enabled,
+        depth_recur_layers=args.depth_recur_layers,
+        depth_recur_start_frac=args.depth_recur_start_frac,
+        parallel_resid_enabled=args.parallel_resid_enabled,
+        parallel_resid_start_layer=args.parallel_resid_start_layer,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -1985,6 +2040,7 @@ def main() -> None:
             for name, t in base_model.state_dict().items():
                 ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
         step += 1
+        base_model._training_step = step  # Update for depth recurrence activation
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
             if swa_state is None:
