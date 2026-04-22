@@ -161,7 +161,7 @@ class Hyperparameters:
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
-    gptq_mixed_precision = bool(int(os.environ.get("GPTQ_MIXED_PRECISION", "1")))  # FIX: Enable mixed precision (required for BigramHash guidance)
+    gptq_mixed_precision = bool(int(os.environ.get("GPTQ_MIXED_PRECISION", "0")))  # REVERT: Use baseline's uniform int6 (BigramHash guidance removed)
 
 # --- Batched Newton-Schulz orthogonalization ---
 
