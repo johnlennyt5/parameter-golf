@@ -423,7 +423,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,smear,dtg_gate,ve_layer_scales,ve_shared.scale,attn_gate,vr_lambda",
     ).split(",")
     if pattern
 )
@@ -1912,8 +1912,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    if base_model.skip_weights.numel() > 0:
-        scalar_params.append(base_model.skip_weights)
+    # INNOVATION #2: skip_compressors are now ModuleList (Linear layers collected as matrix params)
+    # No need to add them here - they're automatically included in block_named_params
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
