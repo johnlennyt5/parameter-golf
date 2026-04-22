@@ -2116,12 +2116,22 @@ def main() -> None:
                     ones_info.append((qk, fi, err))
     if ones_info:
         ones_info.sort(key=lambda x: x[2])
-        def _try_prune(n):
+        t_prune_start = time.perf_counter()
+        # Use fast compression for binary search, lzma only for final
+        def _try_prune(n, use_lzma=False):
             tmp = {k: v.clone() for k, v in quant_result.items()}
             for i in range(min(n, len(ones_info))):
                 tmp[ones_info[i][0]].view(-1)[ones_info[i][1]] = 0
             buf = io.BytesIO(); torch.save({"w": tmp, "m": quant_meta}, buf)
-            return len(lzma.compress(buf.getvalue(), preset=9)) + code_bytes_est, tmp
+            raw = buf.getvalue()
+            if use_lzma:
+                compressed = lzma.compress(raw, preset=9)
+            elif _COMPRESSOR == "zstd":
+                # zstd is 10-20x faster than lzma for size estimation
+                compressed = zstandard.ZstdCompressor(level=3).compress(raw)
+            else:
+                compressed = zlib.compress(raw, level=6)
+            return len(compressed) + code_bytes_est, tmp
         no_sz, _ = _try_prune(0)
         target_bytes = int(target_mb * 1024 * 1024)
         log0(f"selective_prune: {len(ones_info)} ±1 candidates, unpruned={no_sz/(1024*1024):.2f}MB target={target_mb}MB")
@@ -2135,13 +2145,17 @@ def main() -> None:
                 _, quant_result = _try_prune(len(ones_info))
             else:
                 lo, hi = 0, len(ones_info)
+                iters = 0
                 while lo < hi:
                     mid = (lo + hi) // 2
-                    sz, _ = _try_prune(mid)
+                    sz, _ = _try_prune(mid)  # Fast compression for search
                     if sz <= target_bytes: hi = mid
                     else: lo = mid + 1
+                    iters += 1
+                log0(f"selective_prune: binary search completed in {iters} iterations ({time.perf_counter()-t_prune_start:.1f}s)")
                 log0(f"selective_prune: pruning {lo}/{len(ones_info)} ±1 values ({100*lo/len(ones_info):.1f}%) to fit {target_mb}MB")
                 _, quant_result = _try_prune(lo)
+        log0(f"selective_prune: total time {time.perf_counter()-t_prune_start:.1f}s")
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
