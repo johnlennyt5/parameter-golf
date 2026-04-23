@@ -78,8 +78,9 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
-    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    # Bigram config: RESTORED to SOTA values (was 2048/128, caused -73K param regression)
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 3072))
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 112))
     trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default, risky)
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on ALL layers (our novel contribution)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
@@ -103,6 +104,9 @@ class Hyperparameters:
     # Parallel residuals (minimal-param optimization)
     parallel_resid_enabled = bool(int(os.environ.get("PARALLEL_RESID_ENABLED", "1")))
     parallel_resid_start_layer = int(os.environ.get("PARALLEL_RESID_START_LAYER", 7))
+    # Training innovations control flags (Phase 1 Recovery: disabled by default)
+    gradient_surgery_enabled = bool(int(os.environ.get("GRADIENT_SURGERY_ENABLED", "0")))
+    llrd_enabled = bool(int(os.environ.get("LLRD_ENABLED", "0")))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -1955,9 +1959,10 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        # INNOVATION A: Gradient Surgery for U-Net Skip Connections
+        # INNOVATION A: Gradient Surgery for U-Net Skip Connections [DISABLED BY DEFAULT]
+        # NOTE: Caused regression due to dimension mismatch bug (see analysis doc)
         # Orthogonalize skip gradients to encoder gradients (reduce gradient conflict)
-        if base_model.skip_weights.grad is not None and base_model.skip_weights.numel() > 0:
+        if args.gradient_surgery_enabled and base_model.skip_weights.grad is not None and base_model.skip_weights.numel() > 0:
             with torch.no_grad():
                 for i in range(min(base_model.skip_weights.size(0), base_model.num_encoder_layers)):
                     encoder_idx = i
@@ -1977,39 +1982,41 @@ def main() -> None:
                         skip_grad_orth = skip_grad - (dot_prod / main_norm_sq) * skip_grad
                         base_model.skip_weights.grad[i] = skip_grad_orth
 
-        # INNOVATION B: Layer-Wise Learning Rate Decay (U-Net aware)
+        # INNOVATION B: Layer-Wise Learning Rate Decay (U-Net aware) [DISABLED BY DEFAULT]
+        # NOTE: Caused regression due to bad interaction with Muon + grad clipping (see analysis doc)
         # Scale gradients per layer based on U-Net depth (equivalent to per-layer LR)
-        with torch.no_grad():
-            num_encoder = base_model.num_encoder_layers
-            num_decoder = base_model.num_decoder_layers
+        if args.llrd_enabled:
+            with torch.no_grad():
+                num_encoder = base_model.num_encoder_layers
+                num_decoder = base_model.num_decoder_layers
 
-            # Scale parameter bank gradients (banks are [num_layers, ...])
-            for bank_name, bank in [("qo_bank", base_model.qo_bank),
-                                     ("kv_bank", base_model.kv_bank),
-                                     ("mlp_up_bank", base_model.mlp_up_bank),
-                                     ("mlp_down_bank", base_model.mlp_down_bank)]:
-                if bank.grad is not None:
-                    for layer_idx in range(bank.grad.size(0)):
-                        if layer_idx < num_encoder:
-                            # Encoder: lower LR for early layers (0.6× to 1.0×)
-                            lr_scale = 0.6 + 0.4 * (layer_idx / max(num_encoder - 1, 1))
-                        else:
-                            # Decoder: higher LR for late layers (1.0× to 1.2×)
-                            decoder_depth = layer_idx - num_encoder
-                            lr_scale = 1.0 + 0.2 * (decoder_depth / max(num_decoder - 1, 1))
-                        bank.grad[layer_idx].mul_(lr_scale)
+                # Scale parameter bank gradients (banks are [num_layers, ...])
+                for bank_name, bank in [("qo_bank", base_model.qo_bank),
+                                         ("kv_bank", base_model.kv_bank),
+                                         ("mlp_up_bank", base_model.mlp_up_bank),
+                                         ("mlp_down_bank", base_model.mlp_down_bank)]:
+                    if bank.grad is not None:
+                        for layer_idx in range(bank.grad.size(0)):
+                            if layer_idx < num_encoder:
+                                # Encoder: lower LR for early layers (0.6× to 1.0×)
+                                lr_scale = 0.6 + 0.4 * (layer_idx / max(num_encoder - 1, 1))
+                            else:
+                                # Decoder: higher LR for late layers (1.0× to 1.2×)
+                                decoder_depth = layer_idx - num_encoder
+                                lr_scale = 1.0 + 0.2 * (decoder_depth / max(num_decoder - 1, 1))
+                            bank.grad[layer_idx].mul_(lr_scale)
 
-            # Scale block-level scalar params (attn_scale, mlp_scale, etc.)
-            for i, block in enumerate(base_model.blocks):
-                if i < num_encoder:
-                    lr_scale = 0.6 + 0.4 * (i / max(num_encoder - 1, 1))
-                else:
-                    decoder_depth = i - num_encoder
-                    lr_scale = 1.0 + 0.2 * (decoder_depth / max(num_decoder - 1, 1))
+                # Scale block-level scalar params (attn_scale, mlp_scale, etc.)
+                for i, block in enumerate(base_model.blocks):
+                    if i < num_encoder:
+                        lr_scale = 0.6 + 0.4 * (i / max(num_encoder - 1, 1))
+                    else:
+                        decoder_depth = i - num_encoder
+                        lr_scale = 1.0 + 0.2 * (decoder_depth / max(num_decoder - 1, 1))
 
-                for param in block.parameters():
-                    if param.grad is not None and param.ndim < 2:  # Scalar params only
-                        param.grad.mul_(lr_scale)
+                    for param in block.parameters():
+                        if param.grad is not None and param.ndim < 2:  # Scalar params only
+                            param.grad.mul_(lr_scale)
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
