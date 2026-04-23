@@ -1822,11 +1822,22 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     def lr_mul(step: int, elapsed_ms: float) -> float:
+        # Improvement #10: Cosine annealing instead of linear warmdown
+        import math
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
+            if step < warmdown_start:
+                return 1.0
+            elif step >= args.iterations:
+                return 0.0
+            else:
+                # Cosine annealing: 1.0 → 0.1 (min_lr_ratio)
+                progress = (step - warmdown_start) / max(args.warmdown_iters, 1)
+                min_lr_ratio = 0.1
+                return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+        # Wallclock-based warmdown (keep linear for simplicity)
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
@@ -1915,6 +1926,13 @@ def main() -> None:
         train_loss /= grad_accum_steps
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+        # Improvement #10: Inverse momentum scheduling during warmdown
+        # When LR decreases, increase momentum (tighter optimization)
+        lr_scale_current = lr_mul(step, time.perf_counter() * 1000 - t0)
+        if lr_scale_current < 1.0:
+            # Inverse: as LR → 0.1, momentum → 0.995 (from 0.99)
+            momentum_boost = 0.005 * (1.0 - lr_scale_current)
+            muon_momentum = min(muon_momentum + momentum_boost, 0.995)
         for group in optimizer_muon.param_groups:
             group["momentum"] = muon_momentum
         for opt in optimizers:
