@@ -40,7 +40,7 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 500))
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 4000))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 100))  # Longer warmup (20→100) for better stability
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
@@ -1552,14 +1552,15 @@ def _compute_hessian_sensitivity(hessians: dict[str, Tensor]) -> dict[str, float
 
 def _assign_bit_widths(sensitivity: dict[str, float], quantizable_names: list[str]) -> dict[str, int]:
     """Assign int5/int6/int7 per layer based on Hessian sensitivity.
-    Top 20% most sensitive → int7 (clip=63), bottom 30% → int5 (clip=15), rest → int6 (clip=31)."""
+    Top 20% most sensitive → int7 (clip=63), bottom 20% → int5 (clip=15), middle 60% → int6 (clip=31).
+    Phase 4: Optimized distribution for better quantization quality."""
     if not quantizable_names:
         return {}
     scores = [(name, sensitivity.get(name, 0.0)) for name in quantizable_names]
     scores.sort(key=lambda x: x[1])
     n = len(scores)
-    # Bottom 30% → int5, middle 50% → int6, top 20% → int7
-    int5_cutoff = int(n * 0.30)
+    # Phase 4: Bottom 20% → int5, middle 60% → int6, top 20% → int7
+    int5_cutoff = int(n * 0.20)
     int7_cutoff = int(n * 0.80)
     bit_map: dict[str, int] = {}
     for i, (name, _) in enumerate(scores):
@@ -2011,7 +2012,8 @@ def main() -> None:
                 ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
+        # Phase 3: Earlier SWA start (25% through training instead of 80%)
+        if args.swa_enabled and scale < 0.75 and step % args.swa_every == 0:
             if swa_state is None:
                 swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
                 swa_count = 1
