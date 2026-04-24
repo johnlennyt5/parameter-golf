@@ -91,6 +91,8 @@ class Hyperparameters:
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
     value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))  # VRL with sigmoid gates (off by default, risky)
+    # Linear Recurrence (Plan C: SP8192 + Recurrence for SOTA)
+    recurrence_layers = os.environ.get("RECURRENCE_LAYERS", "")  # comma-separated layer indices, empty = no recurrence
     # GPTQ calibration
     gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
     gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
@@ -778,6 +780,50 @@ class Block(nn.Module):
             x_out = x_in + gate * (x_out - x_in)
         return x_out, raw_v
 
+class LinearRecurrenceLayer(nn.Module):
+    """
+    Simple linear recurrence: exponential moving average per dimension.
+    y[t] = alpha * y[t-1] + (1 - alpha) * x[t]
+
+    Provides unbounded context with O(1) memory and O(n) time.
+    Simpler and faster than Mamba-SSM, proven to work for language modeling.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        # Learnable decay per dimension (init to logit(0.9) ≈ 2.2 for reasonable timescale)
+        self.alpha_logit = nn.Parameter(torch.full((dim,), 2.2))
+        self.norm = RMSNorm()
+        # Output projection (optional, allows learning different representation)
+        self.out_scale = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x: (B, L, D)
+        returns: (B, L, D)
+        """
+        residual = x
+        x = self.norm(x)
+
+        # Alpha in (0, 1) via sigmoid (per-dimension decay rates)
+        alpha = torch.sigmoid(self.alpha_logit)  # (D,)
+
+        # Sequential scan (can be parallelized with associative scan, but sequential is fine for now)
+        B, L, D = x.shape
+        h = torch.zeros(B, D, device=x.device, dtype=x.dtype)
+        outputs = []
+
+        for t in range(L):
+            h = alpha * h + (1 - alpha) * x[:, t]  # EMA update
+            outputs.append(h)
+
+        y = torch.stack(outputs, dim=1)  # (B, L, D)
+
+        # Apply learned output scale
+        y = y * self.out_scale.to(dtype=y.dtype)[None, None, :]
+
+        return residual + y
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -805,6 +851,7 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        recurrence_layers: str = "",
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -850,6 +897,12 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        # Linear Recurrence layers (Plan C: SP8192 + Recurrence)
+        self.recurrence_layer_set = set(int(x) for x in recurrence_layers.split(",") if x.strip()) if recurrence_layers else set()
+        self.recurrence_blocks = nn.ModuleList(
+            [LinearRecurrenceLayer(model_dim) for _ in range(len(self.recurrence_layer_set))]
+        )
+        self.recurrence_idx_map = {layer_idx: i for i, layer_idx in enumerate(sorted(self.recurrence_layer_set))}
         if rope_dims > 0:
             head_dim = model_dim // num_heads
             for block in self.blocks:
@@ -930,6 +983,10 @@ class GPT(nn.Module):
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
+            # Apply recurrence if this layer has it
+            if i in self.recurrence_layer_set:
+                rec_idx = self.recurrence_idx_map[i]
+                x = self.recurrence_blocks[rec_idx](x)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -940,6 +997,10 @@ class GPT(nn.Module):
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
+            # Apply recurrence if this layer has it
+            if bi in self.recurrence_layer_set:
+                rec_idx = self.recurrence_idx_map[bi]
+                x = self.recurrence_blocks[rec_idx](x)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -988,6 +1049,10 @@ class GPT(nn.Module):
                 v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
+            # Apply recurrence if this layer has it
+            if i in self.recurrence_layer_set:
+                rec_idx = self.recurrence_idx_map[i]
+                x = self.recurrence_blocks[rec_idx](x)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -998,6 +1063,10 @@ class GPT(nn.Module):
                 self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
                 self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
                 v_embed=ve, v0=v0)
+            # Apply recurrence if this layer has it
+            if bi in self.recurrence_layer_set:
+                rec_idx = self.recurrence_idx_map[bi]
+                x = self.recurrence_blocks[rec_idx](x)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1647,6 +1716,7 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        recurrence_layers=args.recurrence_layers,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
@@ -2072,6 +2142,7 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        recurrence_layers=args.recurrence_layers,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
