@@ -49,7 +49,7 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 13))  # Increased depth (11→13)
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 2))  # GQA-2 (reduced from 4)
-    model_dim = int(os.environ.get("MODEL_DIM", 480))  # Reduced width (512→480) for depth-width tradeoff
+    model_dim = int(os.environ.get("MODEL_DIM", 512))  # FIXED: Keep 512 (480 caused head_dim=60, not multiple of 8 for FlashAttention)
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.5))  # Increased MLP expressiveness (3.0→3.5)
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
