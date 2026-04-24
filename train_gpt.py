@@ -47,13 +47,13 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 11))
-    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    num_layers = int(os.environ.get("NUM_LAYERS", 13))  # Increased depth (11→13)
+    num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 2))  # GQA-2 (reduced from 4)
+    model_dim = int(os.environ.get("MODEL_DIM", 480))  # Reduced width (512→480) for depth-width tradeoff
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
+    mlp_mult = float(os.environ.get("MLP_MULT", 3.5))  # Increased MLP expressiveness (3.0→3.5)
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
-    rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_base = float(os.environ.get("ROPE_BASE", 25000.0))  # Better for seq_len=2048 (10000→25000)
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -85,7 +85,7 @@ class Hyperparameters:
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 112))
     trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default — adds 23ms/step overhead)
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on ALL layers (our novel contribution)
-    rope_dims = int(os.environ.get("ROPE_DIMS", 16))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 32))  # Partial RoPE - more capacity for content (16→32)
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
@@ -838,6 +838,17 @@ class GPT(nn.Module):
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        # Learned skip compression: compress to half dimension, then gated blend
+        skip_compressed_dim = model_dim // 2
+        self.skip_proj = nn.ModuleList([
+            CastedLinear(model_dim, skip_compressed_dim, bias=False)
+            for _ in range(self.num_skip_weights)
+        ])
+        self.skip_gate = nn.ModuleList([
+            CastedLinear(model_dim + skip_compressed_dim, model_dim, bias=False)
+            for _ in range(self.num_skip_weights)
+        ])
+        # Keep simple skip_weights as scalar multipliers
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         # Parameter banks
         head_dim = model_dim // num_heads
@@ -957,7 +968,14 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                # Learned skip compression with gating
+                skip = skips.pop()
+                skip_compressed = self.skip_proj[i](skip)
+                gate = torch.sigmoid(self.skip_gate[i](torch.cat([x, skip_compressed], dim=-1)))
+                # Upsample compressed skip back to model_dim
+                skip_upsampled = F.pad(skip_compressed, (0, x.size(-1) - skip_compressed.size(-1)))
+                # Gated blend: (1-gate)*x + gate*skip, with skip_weights as additional scaling
+                x = (1 - gate) * x + gate * (self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip_upsampled)
             x, _ = self._forward_layer(bi, x, x0, input_ids, ve_cache, v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -1006,7 +1024,14 @@ class GPT(nn.Module):
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                # Learned skip compression with gating
+                skip = skips.pop()
+                skip_compressed = self.skip_proj[i](skip)
+                gate = torch.sigmoid(self.skip_gate[i](torch.cat([x, skip_compressed], dim=-1)))
+                # Upsample compressed skip back to model_dim
+                skip_upsampled = F.pad(skip_compressed, (0, x.size(-1) - skip_compressed.size(-1)))
+                # Gated blend: (1-gate)*x + gate*skip, with skip_weights as additional scaling
+                x = (1 - gate) * x + gate * (self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip_upsampled)
             x, _ = self._forward_layer(bi, x, x0, input_ids, ve_cache, v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -1413,6 +1438,17 @@ class _HessianGPT(nn.Module):
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        # Learned skip compression: compress to half dimension, then gated blend
+        skip_compressed_dim = model_dim // 2
+        self.skip_proj = nn.ModuleList([
+            CastedLinear(model_dim, skip_compressed_dim, bias=False)
+            for _ in range(self.num_skip_weights)
+        ])
+        self.skip_gate = nn.ModuleList([
+            CastedLinear(model_dim + skip_compressed_dim, model_dim, bias=False)
+            for _ in range(self.num_skip_weights)
+        ])
+        # Keep simple skip_weights as scalar multipliers
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
             _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
@@ -1793,7 +1829,21 @@ def main() -> None:
             fused=True,
         )
         replicated_params.append(base_model.lm_head.weight)
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    # Skip projection and gating modules (learned skip compression)
+    skip_params = []
+    for module in base_model.skip_proj:
+        skip_params.append(module.weight)
+        replicated_params.append(module.weight)
+    for module in base_model.skip_gate:
+        skip_params.append(module.weight)
+        replicated_params.append(module.weight)
+    optimizer_skip = torch.optim.Adam(
+        [{"params": skip_params, "lr": args.matrix_lr, "base_lr": args.matrix_lr}],
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        fused=True,
+    )
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar, optimizer_skip]
     if optimizer_head is not None:
         optimizers.append(optimizer_head)
     n_params = sum(p.numel() for p in base_model.parameters())
