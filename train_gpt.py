@@ -38,10 +38,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -60,7 +60,7 @@ class Hyperparameters:
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
@@ -69,6 +69,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    recurrence_layers = os.environ.get("RECURRENCE_LAYERS", "")  # comma-separated indices (e.g., "3,6,9")
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -506,6 +507,39 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+class LinearRecurrenceLayer(nn.Module):
+    """
+    Simple linear recurrence: exponential moving average per dimension.
+    y[t] = alpha * y[t-1] + (1 - alpha) * x[t]
+    Provides unbounded context with O(1) memory and O(n) time.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        # Learnable decay per dimension (init to logit(0.9) ≈ 2.2)
+        self.alpha_logit = nn.Parameter(torch.full((dim,), 2.2))
+        self.norm = RMSNorm()
+        self.out_scale = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        residual = x
+        x = self.norm(x)
+        alpha = torch.sigmoid(self.alpha_logit)  # (D,)
+
+        # Sequential scan
+        B, L, D = x.shape
+        h = torch.zeros(B, D, device=x.device, dtype=x.dtype)
+        outputs = []
+
+        for t in range(L):
+            h = alpha * h + (1 - alpha) * x[:, t]  # EMA update
+            outputs.append(h)
+
+        y = torch.stack(outputs, dim=1)  # (B, L, D)
+        y = y * self.out_scale.to(dtype=y.dtype)[None, None, :]
+        return residual + y
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
@@ -659,6 +693,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        recurrence_layers: str = "",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -684,6 +719,10 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        # Recurrence layers
+        self.recurrence_layer_set = set(int(x) for x in recurrence_layers.split(",") if x.strip()) if recurrence_layers else set()
+        self.recurrence_blocks = nn.ModuleList([LinearRecurrenceLayer(model_dim) for _ in range(len(self.recurrence_layer_set))])
+        self.recurrence_idx_map = {layer_idx: i for i, layer_idx in enumerate(sorted(self.recurrence_layer_set))}
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -706,11 +745,16 @@ class GPT(nn.Module):
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
+            if i in self.recurrence_layer_set:
+                x = self.recurrence_blocks[self.recurrence_idx_map[i]](x)
             skips.append(x)
         for i in range(self.num_decoder_layers):
+            bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[bi](x, x0)
+            if bi in self.recurrence_layer_set:
+                x = self.recurrence_blocks[self.recurrence_idx_map[bi]](x)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -835,6 +879,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        recurrence_layers=args.recurrence_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
