@@ -521,6 +521,7 @@ class LinearRecurrenceLayer(nn.Module):
         self.norm = RMSNorm()
         self.out_scale = nn.Parameter(torch.ones(dim))
 
+    @torch.compiler.disable
     def forward(self, x: Tensor) -> Tensor:
         residual = x
         x = self.norm(x)
