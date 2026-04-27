@@ -509,35 +509,37 @@ class RMSNorm(nn.Module):
 
 class LinearRecurrenceLayer(nn.Module):
     """
-    Simple linear recurrence: exponential moving average per dimension.
-    y[t] = alpha * y[t-1] + (1 - alpha) * x[t]
-    Provides unbounded context with O(1) memory and O(n) time.
+    Compile-friendly linear recurrence using cumulative operations.
+    Approximates EMA: y[t] ≈ weighted sum of past inputs with exponential decay.
     """
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
-        # Learnable decay per dimension (init to logit(0.9) ≈ 2.2)
-        self.alpha_logit = nn.Parameter(torch.full((dim,), 2.2))
+        # Learnable mixing weight (init to 0.1 = mostly keep history)
+        self.mix_logit = nn.Parameter(torch.full((dim,), -2.2))  # sigmoid(-2.2) ≈ 0.1
         self.norm = RMSNorm()
         self.out_scale = nn.Parameter(torch.ones(dim))
 
-    @torch.compiler.disable
     def forward(self, x: Tensor) -> Tensor:
         residual = x
         x = self.norm(x)
-        alpha = torch.sigmoid(self.alpha_logit)  # (D,)
 
-        # Sequential scan
+        # Learnable mix between cumsum (unbounded context) and identity
+        mix = torch.sigmoid(self.mix_logit)  # (D,) in [0, 1]
+
+        # Cumulative sum provides simple unbounded context
+        # Each position sees weighted sum of all previous positions
         B, L, D = x.shape
-        h = torch.zeros(B, D, device=x.device, dtype=x.dtype)
-        outputs = []
+        x_cumsum = torch.cumsum(x, dim=1)  # (B, L, D)
 
-        for t in range(L):
-            h = alpha * h + (1 - alpha) * x[:, t]  # EMA update
-            outputs.append(h)
+        # Normalize by position to prevent explosion
+        positions = torch.arange(1, L + 1, device=x.device, dtype=x.dtype).view(1, L, 1)
+        x_cumsum = x_cumsum / positions.sqrt()
 
-        y = torch.stack(outputs, dim=1)  # (B, L, D)
+        # Mix cumsum with original input
+        y = mix * x_cumsum + (1 - mix) * x
         y = y * self.out_scale.to(dtype=y.dtype)[None, None, :]
+
         return residual + y
 
 
