@@ -52,12 +52,12 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 14400))  # PHASE1: 72% warmdown (SOTA: 0.72 * 20000)
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))  # PHASE1: Match SOTA (was 1024)
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.0))  # PHASE1: Match SOTA (was 1.5)
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
@@ -65,11 +65,11 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 4))  # PHASE1: Match SOTA (was 2)
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 16))  # PHASE1: Partial RoPE - only 16/64 dims (SOTA uses this)
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    recurrence_layers = os.environ.get("RECURRENCE_LAYERS", "")  # comma-separated indices (e.g., "3,6,9")
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -507,42 +507,6 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
-class LinearRecurrenceLayer(nn.Module):
-    """
-    Compile-friendly linear recurrence using cumulative operations.
-    Approximates EMA: y[t] ≈ weighted sum of past inputs with exponential decay.
-    """
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-        # Learnable mixing weight (init to 0.1 = mostly keep history)
-        self.mix_logit = nn.Parameter(torch.full((dim,), -2.2))  # sigmoid(-2.2) ≈ 0.1
-        self.norm = RMSNorm()
-        self.out_scale = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x: Tensor) -> Tensor:
-        residual = x
-        x = self.norm(x)
-
-        # Learnable mix between cumsum (unbounded context) and identity
-        mix = torch.sigmoid(self.mix_logit)  # (D,) in [0, 1]
-
-        # Cumulative sum provides simple unbounded context
-        # Each position sees weighted sum of all previous positions
-        B, L, D = x.shape
-        x_cumsum = torch.cumsum(x, dim=1)  # (B, L, D)
-
-        # Normalize by position to prevent explosion
-        positions = torch.arange(1, L + 1, device=x.device, dtype=x.dtype).view(1, L, 1)
-        x_cumsum = x_cumsum / positions.sqrt()
-
-        # Mix cumsum with original input
-        y = mix * x_cumsum + (1 - mix) * x
-        y = y * self.out_scale.to(dtype=y.dtype)[None, None, :]
-
-        return residual + y
-
-
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
@@ -583,7 +547,15 @@ class Rotary(nn.Module):
         return self._cos_cached.to(dtype=dtype), self._sin_cached.to(dtype=dtype)
 
 
-def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) -> Tensor:
+    # Partial RoPE: only apply to first rope_dims dimensions
+    if rope_dims > 0 and rope_dims < x.size(-1):
+        x_rope, x_pass = x[..., :rope_dims], x[..., rope_dims:]
+        half = rope_dims // 2
+        x1, x2 = x_rope[..., :half], x_rope[..., half:]
+        x_rope = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+        return torch.cat((x_rope, x_pass), dim=-1)
+    # Full RoPE
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
@@ -596,6 +568,7 @@ class CausalSelfAttention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         rope_base: float,
+        rope_dims: int,
         qk_gain_init: float,
     ):
         super().__init__()
@@ -615,7 +588,8 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rope_dims = rope_dims if rope_dims > 0 else self.head_dim
+        self.rotary = Rotary(self.rope_dims, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -625,8 +599,8 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        q = apply_rotary_emb(q, cos, sin, self.rope_dims)
+        k = apply_rotary_emb(k, cos, sin, self.rope_dims)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -662,12 +636,13 @@ class Block(nn.Module):
         num_kv_heads: int,
         mlp_mult: int,
         rope_base: float,
+        rope_dims: int,
         qk_gain_init: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, rope_dims, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -695,8 +670,8 @@ class GPT(nn.Module):
         tied_embed_init_std: float,
         logit_softcap: float,
         rope_base: float,
+        rope_dims: int,
         qk_gain_init: float,
-        recurrence_layers: str = "",
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -717,15 +692,12 @@ class GPT(nn.Module):
                     num_kv_heads,
                     mlp_mult,
                     rope_base,
+                    rope_dims,
                     qk_gain_init,
                 )
                 for i in range(num_layers)
             ]
         )
-        # Recurrence layers
-        self.recurrence_layer_set = set(int(x) for x in recurrence_layers.split(",") if x.strip()) if recurrence_layers else set()
-        self.recurrence_blocks = nn.ModuleList([LinearRecurrenceLayer(model_dim) for _ in range(len(self.recurrence_layer_set))])
-        self.recurrence_idx_map = {layer_idx: i for i, layer_idx in enumerate(sorted(self.recurrence_layer_set))}
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -748,16 +720,12 @@ class GPT(nn.Module):
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
-            if i in self.recurrence_layer_set:
-                x = self.recurrence_blocks[self.recurrence_idx_map[i]](x)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[bi](x, x0)
-            if bi in self.recurrence_layer_set:
-                x = self.recurrence_blocks[self.recurrence_idx_map[bi]](x)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -881,8 +849,8 @@ def main() -> None:
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
+        rope_dims=args.rope_dims,
         qk_gain_init=args.qk_gain_init,
-        recurrence_layers=args.recurrence_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
