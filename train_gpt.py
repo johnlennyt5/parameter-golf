@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import lzma
 import math
 import os
 import random
@@ -51,7 +52,7 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
-    iterations = int(os.environ.get("ITERATIONS", 20000))
+    iterations = int(os.environ.get("ITERATIONS", 16000))  # FIX: Reduced from 20000 to fit in 600s
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 14400))  # PHASE1: 72% warmdown (SOTA: 0.72 * 20000)
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
@@ -330,14 +331,14 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
             else torch.empty((t32.shape[0],), dtype=torch.float32)
         )
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        scale = (clip_abs / 31.0).clamp_min(1.0 / 31.0)  # FIX: int6 range (was 127 for int8)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -31, 31).to(torch.int8).contiguous()  # FIX: int6 range
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
-    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
-    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    scale = torch.tensor(clip_abs / 31.0 if clip_abs > 0 else 1.0, dtype=torch.float32)  # FIX: int6 range (was 127)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -31, 31).to(torch.int8).contiguous()  # FIX: int6 range
     return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
@@ -1079,7 +1080,7 @@ def main() -> None:
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
+    # the compressed int6+lzma artifact and validate the round-tripped weights.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1093,25 +1094,25 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    quant_blob = lzma.compress(quant_raw, preset=9)  # FIX: LZMA for better compression (was zlib)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open("final_model.int6.lzma", "wb") as f:  # FIX: int6+lzma filename
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize("final_model.int6.lzma")
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model int6+lzma: {quant_file_bytes} bytes "  # FIX: int6+lzma log
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int6+lzma: {quant_file_bytes + code_bytes} bytes")  # FIX: int6+lzma log
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open("final_model.int6.lzma", "rb") as f:  # FIX: int6+lzma filename
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")  # FIX: LZMA decompression
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
@@ -1129,10 +1130,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int6_lzma_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "  # FIX: int6+lzma log
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int6_lzma_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")  # FIX: int6+lzma log
 
     if distributed:
         dist.destroy_process_group()
