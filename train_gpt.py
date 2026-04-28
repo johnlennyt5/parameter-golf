@@ -72,6 +72,13 @@ class Hyperparameters:
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))  # PHASE1: Partial RoPE - only 16/64 dims (SOTA uses this)
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
+    # Layer looping (depth recurrence) - PHASE1: Match SOTA
+    num_loops = int(os.environ.get("NUM_LOOPS", 2))  # Loop 3 times total (2+1)
+    loop_start = int(os.environ.get("LOOP_START", 3))  # Start looping at layer 3
+    loop_end = int(os.environ.get("LOOP_END", 5))  # End looping at layer 5
+    enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))  # Enable at 35% of training
+    parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", 7))  # Parallel residuals from layer 7
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -648,14 +655,25 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.parallel = False  # Set to True for parallel residuals (attn + MLP both read same input)
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+
+        if self.parallel:
+            # Parallel residuals: attn and MLP both read from x_in
+            attn_out = self.attn(self.attn_norm(x_in))
+            mlp_out = self.mlp(self.mlp_norm(x_in))
+            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out + \
+                           self.mlp_scale.to(dtype=x_in.dtype)[None, None, :] * mlp_out
+        else:
+            # Sequential residuals: standard transformer
+            attn_out = self.attn(self.attn_norm(x_in))
+            x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
+            x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out))
+
+        return x_out
 
 
 class GPT(nn.Module):
@@ -673,6 +691,10 @@ class GPT(nn.Module):
         rope_base: float,
         rope_dims: int,
         qk_gain_init: float,
+        num_loops: int = 0,
+        loop_start: int = 0,
+        loop_end: int = 0,
+        parallel_residual_start: int = -1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -681,9 +703,32 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+
+        # Layer looping (depth recurrence) - creates virtual layers by repeating a segment
+        self.looping_active = False  # Will be enabled during training
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+
+        if num_loops > 0:
+            # Example: num_layers=11, loop_start=3, loop_end=5, num_loops=2
+            # Creates: [0,1,2, 3,4,5, 3,4,5, 3,4,5, 6,7,8,9,10]
+            # = 15 effective layers from 11 physical layers
+            loop_seg = list(range(loop_start, loop_end + 1))  # [3,4,5]
+            all_indices = list(range(loop_start))  # [0,1,2]
+            for _ in range(num_loops + 1):  # Loop 3 times (num_loops=2 means +1=3 total)
+                all_indices.extend(loop_seg)  # Add [3,4,5] three times
+            all_indices.extend(range(loop_end + 1, num_layers))  # [6,7,8,9,10]
+
+            # Split into encoder/decoder
+            num_enc = len(all_indices) // 2
+            self.encoder_indices = all_indices[:num_enc]
+            self.decoder_indices = all_indices[num_enc:]
+        else:
+            # No looping: simple half-and-half split
+            self.encoder_indices = list(range(self.num_encoder_layers))
+            self.decoder_indices = list(range(self.num_encoder_layers, num_layers))
+
+        self.num_skip_weights = min(len(self.encoder_indices), len(self.decoder_indices))
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
             [
@@ -699,6 +744,12 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+
+        # Enable parallel residuals for specified layers
+        if parallel_residual_start >= 0:
+            for i in range(parallel_residual_start, num_layers):
+                self.blocks[i].parallel = True
+
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -718,15 +769,20 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
 
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
+        # Use looped indices if looping is active, otherwise use simple encoder/decoder split
+        enc_iter = self.encoder_indices if self.looping_active else range(self.num_encoder_layers)
+        dec_iter = self.decoder_indices if self.looping_active else range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
+
+        # Encoder: iterate through encoder (may include looped layers when active)
+        for i in enc_iter:
             x = self.blocks[i](x, x0)
             skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[bi](x, x0)
+
+        # Decoder: iterate through decoder, consuming skips in reverse
+        for skip_idx, i in enumerate(dec_iter):
+            if skip_idx < self.num_skip_weights and skips:
+                x = x + self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -852,6 +908,10 @@ def main() -> None:
         rope_base=args.rope_base,
         rope_dims=args.rope_dims,
         qk_gain_init=args.qk_gain_init,
+        num_loops=args.num_loops,
+        loop_start=args.loop_start,
+        loop_end=args.loop_end,
+        parallel_residual_start=args.parallel_residual_start,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1051,6 +1111,14 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+
+        # Enable layer looping at specified fraction of training (SOTA uses 0.35 = 35%)
+        if args.num_loops > 0 and not base_model.looping_active:
+            frac_complete = step / args.iterations
+            if frac_complete >= args.enable_looping_at:
+                base_model.looping_active = True
+                log0(f"layer_looping_enabled: step={step} frac={frac_complete:.2%}")
+
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
