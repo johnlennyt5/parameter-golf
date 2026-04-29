@@ -2347,38 +2347,35 @@ def _kronecker_factorize(E, rank, als_iters=10):
     B = torch.randn(n_B, rank, device=device) * 0.01
     C = torch.randn(m, rank, device=device) * 0.01
 
-    # Alternating Least Squares optimization
+    # Simplified Alternating Least Squares optimization
+    # Optimize: E_padded ≈ kron(A, B) @ C^T
     for _ in range(als_iters):
-        # Update A (fix B, C)
-        # E_3d ≈ sum_r A[:, r:r+1] ⊗ B[:, r:r+1] @ C[:, r:r+1]^T
-        # Flatten to solve: E_flat ≈ (B ⊗ A) @ C^T
-        for r in range(rank):
-            BC = torch.einsum('i,j,k->ijk', B[:, r], torch.ones(n_A, device=device), C[:, r])
-            residual = E_3d - sum(
-                torch.einsum('i,j,k->ijk', B[:, s], A[:, s], C[:, s])
-                for s in range(rank) if s != r
-            )
-            # Solve for A[:, r]: minimize ||residual - A_r ⊗ B_r @ C_r^T||
-            A[:, r] = torch.einsum('ijk,jk->i', residual, torch.einsum('j,k->jk', B[:, r], C[:, r]))
-            denom = (B[:, r]**2).sum() * (C[:, r]**2).sum()
-            if denom > 1e-10:
-                A[:, r] /= denom
+        # Update C (fix A, B) - most straightforward
+        kron_AB = torch.kron(A, B)  # (n_padded, rank)
+        # Solve C: E_padded ≈ kron_AB @ C^T  =>  E_padded^T ≈ C @ kron_AB^T
+        # Use lstsq: C = (kron_AB^T @ kron_AB)^-1 @ kron_AB^T @ E_padded
+        try:
+            C = torch.linalg.lstsq(kron_AB, E_padded).solution.T  # (m, rank)
+        except:
+            # Fallback if lstsq fails
+            C = (torch.pinverse(kron_AB) @ E_padded).T
 
-        # Update B (fix A, C)
-        for r in range(rank):
-            residual = E_3d - sum(
-                torch.einsum('i,j,k->ijk', B[:, s], A[:, s], C[:, s])
-                for s in range(rank) if s != r
-            )
-            B[:, r] = torch.einsum('ijk,ik->j', residual, torch.einsum('i,k->ik', A[:, r], C[:, r]))
-            denom = (A[:, r]**2).sum() * (C[:, r]**2).sum()
-            if denom > 1e-10:
-                B[:, r] /= denom
+        # Update A and B jointly using gradients (simple approach)
+        # Compute residual: R = E_padded - kron(A, B) @ C^T
+        reconstruction = kron_AB @ C.T
+        residual = E_padded - reconstruction
 
-        # Update C (fix A, B)
-        # Reshape E_3d back and solve for C
-        kron_AB = torch.kron(A, B)[:n_padded, :]  # (n_padded, rank)
-        C = torch.linalg.lstsq(kron_AB, E_padded).solution[:rank, :].T  # (m, rank)
+        # Simple gradient step for A and B
+        lr = 0.01
+        # Gradient for A: reshape residual and compute contribution
+        grad_kron = residual @ C  # (n_padded, rank)
+        # Split gradient into A and B components
+        grad_kron_3d = grad_kron.reshape(n_A, n_B, rank)
+        grad_A = grad_kron_3d.sum(dim=1)  # (n_A, rank)
+        grad_B = grad_kron_3d.sum(dim=0)  # (n_B, rank)
+
+        A = A + lr * grad_A
+        B = B + lr * grad_B
 
     return A, B, C, n_A, n_B
 
