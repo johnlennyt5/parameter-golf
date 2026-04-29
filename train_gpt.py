@@ -67,20 +67,20 @@ class Hyperparameters:
     ttt_eval_seq_len = int(os.environ.get("TTT_EVAL_SEQ_LEN", 1024))
     ttt_batch_size = int(os.environ.get("TTT_BATCH_SIZE", 64))
 
-    # Model shape.
+    # Model shape - Optimized to fit under 16MB
     vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
-    num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_layers = int(os.environ.get("NUM_LAYERS", 8))  # Reduced from 9 to fit size limit
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 4))  # PHASE1: Match SOTA (was 2)
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))  # Reduced from 4 to fit size limit
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))  # PHASE1: Partial RoPE - only 16/64 dims (SOTA uses this)
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # Layer looping (depth recurrence) - PHASE1: Match SOTA
-    num_loops = int(os.environ.get("NUM_LOOPS", 2))  # Loop 3 times total (2+1)
+    # Layer looping (depth recurrence) - DISABLED for stability
+    num_loops = int(os.environ.get("NUM_LOOPS", 0))  # DISABLED - looping causes instability
     loop_start = int(os.environ.get("LOOP_START", 3))  # Start looping at layer 3
     loop_end = int(os.environ.get("LOOP_END", 5))  # End looping at layer 5
     enable_looping_at = float(os.environ.get("ENABLE_LOOPING_AT", 0.35))  # Enable at 35% of training
