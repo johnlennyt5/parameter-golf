@@ -586,7 +586,8 @@ def dequantize_mixed_int6(obj: dict[str, object]) -> dict[str, Tensor]:
 # -----------------------------
 
 def gptq_collect_hessians(model: nn.Module, train_loader, device: torch.device,
-                           num_batches: int, dim: int, mlp_dim: int, num_layers: int) -> dict[str, Tensor]:
+                           num_batches: int, dim: int, mlp_dim: int, num_layers: int,
+                           batch_tokens: int, seq_len: int, grad_accum_steps: int) -> dict[str, Tensor]:
     """Collect Hessian matrices H = X^T X from training data for GPTQ calibration."""
     hessians = _init_hessians(num_layers, dim, mlp_dim, device)
 
@@ -598,7 +599,7 @@ def gptq_collect_hessians(model: nn.Module, train_loader, device: torch.device,
     model.eval()
     with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
         for _ in range(num_batches):
-            x, y = train_loader.next_batch()
+            x, y = train_loader.next_batch(batch_tokens, seq_len, grad_accum_steps)
             model(x, y)
             _accum_hessians(hessians, model.blocks, dim, mlp_dim)
 
@@ -1694,7 +1695,10 @@ def main() -> None:
         num_batches=32,  # Use 32 batches for calibration
         dim=args.model_dim,
         mlp_dim=args.model_dim * args.mlp_mult,
-        num_layers=args.num_layers
+        num_layers=args.num_layers,
+        batch_tokens=args.train_batch_tokens,
+        seq_len=args.train_seq_len,
+        grad_accum_steps=grad_accum_steps
     )
     log0(f"Collected {len(gptq_hessians)} Hessian matrices")
 
