@@ -1968,12 +1968,31 @@ PACKED_REPLICATED_GRAD_MAX_NUMEL = 1 << 15
 
 class Optimizers:
     def __init__(self, h, base_model):
-        matrix_params = [
-            base_model.qo_bank,
-            base_model.kv_bank,
-            base_model.mlp_up_bank,
-            base_model.mlp_down_bank,
-        ]
+        # Handle cross-layer sharing vs original weight banks
+        if hasattr(base_model, 'cross_layer_sharing') and base_model.cross_layer_sharing:
+            # Cross-layer sharing: use base weights + deltas
+            matrix_params = [
+                base_model.qo_base,
+                base_model.kv_base,
+                base_model.mlp_up_base,
+                base_model.mlp_down_base,
+                base_model.qo_delta_U,
+                base_model.qo_delta_V,
+                base_model.kv_delta_U,
+                base_model.kv_delta_V,
+                base_model.mlp_up_delta_U,
+                base_model.mlp_up_delta_V,
+                base_model.mlp_down_delta_U,
+                base_model.mlp_down_delta_V,
+            ]
+        else:
+            # Original weight banks
+            matrix_params = [
+                base_model.qo_bank,
+                base_model.kv_bank,
+                base_model.mlp_up_bank,
+                base_model.mlp_down_bank,
+            ]
         block_named_params = list(base_model.blocks.named_parameters())
         scalar_params = [
             p
