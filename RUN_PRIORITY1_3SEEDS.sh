@@ -12,13 +12,6 @@ for SEED in 0 42 1234; do
     TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model \
     VOCAB_SIZE=8192 \
     CASEOPS_ENABLED=1 \
-    CROSS_LAYER_SHARING=1 \
-    DELTA_RANK=32 \
-    KFEC_ENABLED=1 \
-    KFEC_RANK=8 \
-    KFEC_TOP_K=3 \
-    KFEC_FACTOR_BITS=4 \
-    KFEC_ALS_ITERS=10 \
     LQER_ENABLED=0 \
     SEED=$SEED \
     torchrun --standalone --nproc_per_node=8 train_gpt.py
