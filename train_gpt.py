@@ -998,9 +998,9 @@ class GPT(nn.Module):
         dec_iter = self.decoder_indices if self.looping_active else range(self.num_encoder_layers, self.num_encoder_layers + self.num_decoder_layers)
 
         # Encoder: iterate through encoder (may include looped layers when active)
-        for idx, i in enumerate(enc_iter):
-            qd = lora.q_loras[idx] if lora else None
-            vd = lora.v_loras[idx] if lora else None
+        for i in enc_iter:
+            qd = lora.q_loras[i] if lora else None  # Use physical layer index i, not enumeration
+            vd = lora.v_loras[i] if lora else None
             x = self.blocks[i](x, x0, qd, vd)
             skips.append(x)
 
@@ -1008,9 +1008,8 @@ class GPT(nn.Module):
         for skip_idx, i in enumerate(dec_iter):
             if skip_idx < self.num_skip_weights and skips:
                 x = x + self.skip_weights[skip_idx].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            idx = len(enc_iter) + skip_idx
-            qd = lora.q_loras[idx] if lora else None
-            vd = lora.v_loras[idx] if lora else None
+            qd = lora.q_loras[i] if lora else None  # Use physical layer index i
+            vd = lora.v_loras[i] if lora else None
             x = self.blocks[i](x, x0, qd, vd)
 
         x = self.final_norm(x)
