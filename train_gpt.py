@@ -3012,10 +3012,12 @@ def eval_val(h, device, val_data, model, forward_logits_fn=None):
             val_token_count += float(y.numel())
             prev_ids = x
             tgt_ids = y
-            sidecar_slice = val_data.val_bytes[raw_start + 1 : raw_end].to(
-                device=device, dtype=torch.int32, non_blocking=True
-            )
-            val_byte_count += sidecar_slice.to(torch.float64).sum()
+            # Only use byte sidecar if CaseOps is enabled
+            if val_data.val_bytes is not None:
+                sidecar_slice = val_data.val_bytes[raw_start + 1 : raw_end].to(
+                    device=device, dtype=torch.int32, non_blocking=True
+                )
+                val_byte_count += sidecar_slice.to(torch.float64).sum()
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
