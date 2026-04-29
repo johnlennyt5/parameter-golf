@@ -489,8 +489,12 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
 
-def mixed_quantize_int6(state_dict: dict[str, Tensor]):
-    """Mixed int6/int8 quantization: int6 for attention/MLP matrices, int8 for embeddings."""
+def mixed_quantize_int6(state_dict: dict[str, Tensor], hessians: dict[str, Tensor] | None = None):
+    """Mixed int6/int8 quantization: int6 for attention/MLP matrices, int8 for embeddings.
+
+    If hessians are provided, uses full GPTQ with Cholesky error compensation.
+    Otherwise falls back to grid search quantization.
+    """
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     stats = dict.fromkeys(
@@ -535,7 +539,12 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor]):
         use_int6 = any(p in name for p in int6_patterns) and t.ndim >= 2
 
         if use_int6:
-            q, s = quantize_int6_per_row(t, clip_range=31)
+            # Use full GPTQ if Hessian is available
+            H = hessians.get(name) if hessians else None
+            if H is not None:
+                q, s = gptq_quantize_weight(t, H, clip_range=31)
+            else:
+                q, s = quantize_int6_per_row(t, clip_range=31)
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int6", "dtype": str(t.dtype).removeprefix("torch.")}
@@ -571,6 +580,156 @@ def dequantize_mixed_int6(obj: dict[str, object]) -> dict[str, Tensor]:
             out[name] = (q.float() * float(s.item())).to(dtype)
 
     return out
+
+# -----------------------------
+# FULL HESSIAN-BASED GPTQ
+# -----------------------------
+
+def gptq_collect_hessians(model: nn.Module, train_loader, device: torch.device,
+                           num_batches: int, dim: int, mlp_dim: int, num_layers: int) -> dict[str, Tensor]:
+    """Collect Hessian matrices H = X^T X from training data for GPTQ calibration."""
+    hessians = _init_hessians(num_layers, dim, mlp_dim, device)
+
+    # Enable GPTQ hooks
+    for block in model.blocks:
+        block.attn._save_gptq = True
+        block.mlp._save_gptq = True
+
+    model.eval()
+    with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+        for _ in range(num_batches):
+            x, y = train_loader.next_batch()
+            model(x, y)
+            _accum_hessians(hessians, model.blocks, dim, mlp_dim)
+
+    # Disable GPTQ hooks
+    for block in model.blocks:
+        block.attn._save_gptq = False
+        block.mlp._save_gptq = False
+
+    _finalize_hessians(hessians, num_batches)
+    model.train()
+    return hessians
+
+# -----------------------------
+# FULL HESSIAN-BASED GPTQ
+# -----------------------------
+
+def gptq_quantize_weight(W: Tensor, H: Tensor, clip_range: int = 31,
+                          block_size: int = 128, percdamp: float = 0.01) -> tuple[Tensor, Tensor]:
+    """Full GPTQ with Cholesky error compensation (Frantar et al., ICLR 2023)."""
+    W_orig = W.float().clone()
+    rows, cols = W_orig.shape
+    H = H.float().clone()
+
+    # Handle dead features
+    dead = torch.diag(H) == 0
+    H[dead, dead] = 1
+    damp = percdamp * H.diag().mean()
+    H.diagonal().add_(damp)
+
+    # Actorder: sort by diagonal (importance)
+    perm = torch.argsort(H.diag(), descending=True)
+    invperm = torch.argsort(perm)
+    W_perm = W_orig[:, perm].clone()
+    W_perm[:, dead[perm]] = 0
+    H = H[perm][:, perm]
+
+    # Cholesky decomposition
+    try:
+        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+        Hinv = torch.linalg.cholesky(Hinv, upper=True)
+    except torch.linalg.LinAlgError:
+        # Fallback to grid search if Cholesky fails
+        return quantize_int6_per_row(W_orig, clip_range)
+
+    # Grid search for best clipping
+    best_q, best_scale, best_err = None, None, float('inf')
+    for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
+        if pct < 1.0:
+            row_clip = torch.quantile(W_orig.abs(), pct, dim=1)
+        else:
+            row_clip = W_orig.abs().amax(dim=1)
+        s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
+        sf = s.float()
+
+        # Quantize with error compensation
+        Q = torch.zeros(rows, cols, dtype=torch.int8)
+        W_work = W_perm.clone()
+
+        for i1 in range(0, cols, block_size):
+            i2 = min(i1 + block_size, cols)
+            W_block = W_work[:, i1:i2].clone()
+            Hinv_block = Hinv[i1:i2, i1:i2]
+            Err = torch.zeros(rows, i2 - i1)
+
+            for j in range(i2 - i1):
+                w_col = W_block[:, j]
+                d = Hinv_block[j, j]
+                q_col = torch.clamp(torch.round(w_col / sf), -clip_range, clip_range)
+                Q[:, i1 + j] = q_col.to(torch.int8)
+                err = (w_col - q_col.float() * sf) / d
+                Err[:, j] = err
+                # Propagate error to remaining columns
+                W_block[:, j:] -= err.unsqueeze(1) * Hinv_block[j, j:].unsqueeze(0)
+
+            # Propagate block error to remaining blocks
+            if i2 < cols:
+                W_work[:, i2:] -= Err @ Hinv[i1:i2, i2:]
+
+        recon = Q.float() * sf[:, None]
+        mse = (W_perm - recon).pow(2).mean().item()
+        if mse < best_err:
+            best_q, best_scale, best_err = Q, s, mse
+
+    # Unpermute
+    best_q = best_q[:, invperm]
+    return best_q, best_scale
+
+def _init_hessians(num_layers: int, dim: int, mlp_dim: int, device: torch.device) -> dict[str, Tensor]:
+    """Initialize Hessian matrices for all quantizable weights."""
+    h: dict[str, Tensor] = {}
+    for i in range(num_layers):
+        # Attention weights (Q, K, V share same input, so same Hessian)
+        for k in ['c_q', 'c_k', 'c_v']:
+            h[f'blocks.{i}.attn.{k}.weight'] = torch.zeros(dim, dim, dtype=torch.float32, device=device)
+        h[f'blocks.{i}.attn.proj.weight'] = torch.zeros(dim, dim, dtype=torch.float32, device=device)
+        # MLP weights
+        h[f'blocks.{i}.mlp.fc.weight'] = torch.zeros(dim, dim, dtype=torch.float32, device=device)
+        h[f'blocks.{i}.mlp.proj.weight'] = torch.zeros(mlp_dim, mlp_dim, dtype=torch.float32, device=device)
+    return h
+
+def _accum_hessians(hessians: dict[str, Tensor], blocks: nn.ModuleList, dim: int, mlp_dim: int) -> None:
+    """Accumulate Hessian matrices from saved activations."""
+    for i, block in enumerate(blocks):
+        # Attention Hessians: H = X^T X
+        if hasattr(block.attn, '_gptq_qkv_in'):
+            qkv_in = block.attn._gptq_qkv_in.float().reshape(-1, dim)
+            h_qkv = qkv_in.t() @ qkv_in
+            hessians[f'blocks.{i}.attn.c_q.weight'] += h_qkv
+            hessians[f'blocks.{i}.attn.c_k.weight'] += h_qkv
+            hessians[f'blocks.{i}.attn.c_v.weight'] += h_qkv
+
+        if hasattr(block.attn, '_gptq_proj_in'):
+            proj_in = block.attn._gptq_proj_in.float().reshape(-1, dim)
+            hessians[f'blocks.{i}.attn.proj.weight'] += proj_in.t() @ proj_in
+
+        # MLP Hessians
+        if hasattr(block.mlp, '_gptq_fc_in'):
+            fc_in = block.mlp._gptq_fc_in.float().reshape(-1, dim)
+            hessians[f'blocks.{i}.mlp.fc.weight'] += fc_in.t() @ fc_in
+
+        if hasattr(block.mlp, '_gptq_proj_in'):
+            proj_in = block.mlp._gptq_proj_in.float().reshape(-1, mlp_dim)
+            hessians[f'blocks.{i}.mlp.proj.weight'] += proj_in.t() @ proj_in
+
+def _finalize_hessians(hessians: dict[str, Tensor], num_batches: int) -> None:
+    """Average Hessians and add damping for numerical stability."""
+    for name in hessians:
+        hessians[name] = hessians[name].cpu() / num_batches
+        # Add damping: 1% of mean diagonal
+        damp = 0.01 * torch.diag(hessians[name]).mean().clamp_min(1e-6)
+        hessians[name] += damp * torch.eye(hessians[name].shape[0])
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -926,6 +1085,10 @@ class CausalSelfAttention(nn.Module):
         self.rotary = Rotary(self.rope_dims, base=rope_base)
 
     def forward(self, x: Tensor, q_delta=None, v_delta=None) -> Tensor:
+        # Save input for GPTQ Hessian collection
+        if getattr(self, '_save_gptq', False):
+            self._gptq_qkv_in = x.detach()
+
         bsz, seqlen, dim = x.shape
         q = self.c_q(x)
         if q_delta is not None:
@@ -951,6 +1114,11 @@ class CausalSelfAttention(nn.Module):
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+
+        # Save projection input for GPTQ Hessian collection
+        if getattr(self, '_save_gptq', False):
+            self._gptq_proj_in = y.detach()
+
         return self.proj(y)
 
 
@@ -964,8 +1132,18 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
+        # Save input for GPTQ Hessian collection
+        if getattr(self, '_save_gptq', False):
+            self._gptq_fc_in = x.detach()
+
         x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        x_sq = x.square()
+
+        # Save projection input for GPTQ Hessian collection
+        if getattr(self, '_save_gptq', False):
+            self._gptq_proj_in = x_sq.detach()
+
+        return self.proj(x_sq)
 
 
 class Block(nn.Module):
@@ -1507,8 +1685,21 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    # Use mixed int6/int8 quantization for better compression
-    quant_obj, quant_stats = mixed_quantize_int6(base_model.state_dict())
+    # Collect Hessian matrices for full GPTQ quantization
+    log0("Collecting Hessians for GPTQ calibration...")
+    gptq_hessians = gptq_collect_hessians(
+        base_model,
+        train_loader,
+        device,
+        num_batches=32,  # Use 32 batches for calibration
+        dim=args.model_dim,
+        mlp_dim=args.model_dim * args.mlp_mult,
+        num_layers=args.num_layers
+    )
+    log0(f"Collected {len(gptq_hessians)} Hessian matrices")
+
+    # Use mixed int6/int8 quantization with full GPTQ
+    quant_obj, quant_stats = mixed_quantize_int6(base_model.state_dict(), hessians=gptq_hessians)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
