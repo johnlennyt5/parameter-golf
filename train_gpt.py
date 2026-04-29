@@ -464,6 +464,114 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale
 
+def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
+    """GPTQ-lite int6 quantization with grid search over clipping percentiles."""
+    t32 = t.float()
+    if t32.ndim == 2:
+        # Grid search over clipping percentiles to minimize reconstruction error
+        best_q, best_s, best_err = None, None, float('inf')
+        for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
+            if pct < 1.0:
+                row_clip = torch.quantile(t32.abs(), pct, dim=1)
+            else:
+                row_clip = t32.abs().amax(dim=1)
+            s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
+            q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)
+            recon = q.float() * s.float()[:, None]
+            err = (t32 - recon).pow(2).mean().item()
+            if err < best_err:
+                best_q, best_s, best_err = q, s, err
+        return best_q, best_s
+
+    # Vectors / scalars use simple per-tensor quantization
+    amax = t32.abs().max().item()
+    scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
+    q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
+    return q, scale
+
+def mixed_quantize_int6(state_dict: dict[str, Tensor]):
+    """Mixed int6/int8 quantization: int6 for attention/MLP matrices, int8 for embeddings."""
+    result: dict[str, Tensor] = {}
+    meta: dict[str, object] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int6_payload_bytes"),
+        0,
+    )
+
+    # Determine which layers use int6 (attention/MLP matrices)
+    int6_patterns = {"attn.c_q.", "attn.c_k.", "attn.c_v.", "attn.proj.", "mlp.fc.", "mlp.proj."}
+
+    for name, tensor in state_dict.items():
+        t = tensor.detach().cpu().contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+
+        # Passthrough for non-float and small tensors
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            result[name] = t
+            meta[name] = "passthrough"
+            stats["int6_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        # Control tensors (layernorm, scales, etc.) stay in fp32
+        if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
+            result[name] = t.float()
+            meta[name] = "passthrough_ctrl"
+            stats["int6_payload_bytes"] += tensor_nbytes(t)
+            continue
+
+        # Small float tensors stored as fp16
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            result[name] = t.to(torch.float16) if t.dtype in {torch.float32, torch.bfloat16} else t
+            meta[name] = "passthrough_fp16"
+            stats["int6_payload_bytes"] += tensor_nbytes(result[name])
+            continue
+
+        stats["num_float_tensors"] += 1
+
+        # Use int6 for attention/MLP matrices, int8 for embeddings
+        use_int6 = any(p in name for p in int6_patterns) and t.ndim >= 2
+
+        if use_int6:
+            q, s = quantize_int6_per_row(t, clip_range=31)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int6", "dtype": str(t.dtype).removeprefix("torch.")}
+        else:
+            q, s = quantize_float_tensor(t)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = {"type": "int8", "dtype": str(t.dtype).removeprefix("torch.")}
+
+        stats["int6_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+
+    return {"__quant_format__": "mixed_int6_v1", "tensors": result, "meta": meta}, stats
+
+def dequantize_mixed_int6(obj: dict[str, object]) -> dict[str, Tensor]:
+    """Decompress mixed int6/int8 quantized state dict."""
+    tensors = obj["tensors"]
+    meta = obj["meta"]
+    out: dict[str, Tensor] = {}
+
+    for name, info in meta.items():
+        if isinstance(info, str):  # passthrough
+            out[name] = tensors[name]
+            continue
+
+        # Quantized tensor - reconstruct from .q and .scale
+        q = tensors[name + ".q"]
+        s = tensors[name + ".scale"]
+        dtype = getattr(torch, info["dtype"])
+
+        if s.ndim > 0:  # per-row quantization
+            out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype)
+        else:  # per-tensor quantization
+            out[name] = (q.float() * float(s.item())).to(dtype)
+
+    return out
+
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
@@ -1399,30 +1507,31 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    # Use mixed int6/int8 quantization for better compression
+    quant_obj, quant_stats = mixed_quantize_int6(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = lzma.compress(quant_raw, preset=9)  # FIX: LZMA for better compression (was zlib)
+    quant_blob = lzma.compress(quant_raw, preset=9)  # LZMA for better compression
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.lzma", "wb") as f:
+        with open("final_model.int6.lzma", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.lzma")
+        quant_file_bytes = os.path.getsize("final_model.int6.lzma")
         code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int6_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+lzma: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"Serialized model int6+lzma: {quant_file_bytes} bytes "
+            f"(payload:{quant_stats['int6_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+lzma: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int6+lzma: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.lzma", "rb") as f:
+    with open("final_model.int6.lzma", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(lzma.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    base_model.load_state_dict(dequantize_mixed_int6(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1439,10 +1548,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_lzma_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int6_lzma_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_lzma_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int6_lzma_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     # -----------------------------
     # TEST-TIME TRAINING EVALUATION
@@ -1456,10 +1565,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_lzma_ttt val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} "
+        f"final_int6_lzma_ttt val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
     )
-    log0(f"final_int8_lzma_ttt_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
+    log0(f"final_int6_lzma_ttt_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
