@@ -2452,18 +2452,34 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             cs = h.matrix_clip_sigmas
         bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
         clip_range = 2 ** (bits - 1) - 1
-        ret = gptq_quantize_weight(
-            t, hessians[name], clip_sigmas=cs, clip_range=clip_range
-        )
-        q, s = ret
-        result[name + ".q"] = q
-        result[name + ".scale"] = s
-        meta[name] = f"gptq (int{bits})"
-        # Collect quantization error candidates for either LQER or KFEC
-        if lqer_on or getattr(h, "kfec_enabled", False):
-            W_q = q.float() * s.float().view(-1, 1)
-            E = t.float() - W_q
-            lqer_cands[name] = (E, float(E.norm()))
+
+        # For cross-layer sharing parameters, use simple quantization (no GPTQ Hessian)
+        # since we don't have Hessians collected for base/delta parameters
+        if name not in hessians:
+            # Simple min-max quantization without GPTQ
+            t_abs = t.abs()
+            t_max = t_abs.max(dim=1, keepdim=True)[0]
+            scale = t_max / clip_range
+            scale = scale.clamp(min=1e-8)
+            q = (t / scale).round().clamp(-clip_range, clip_range).to(torch.int8)
+            s = scale.squeeze(1).to(torch.float16)
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = f"simple (int{bits})"
+        else:
+            # GPTQ quantization with Hessian
+            ret = gptq_quantize_weight(
+                t, hessians[name], clip_sigmas=cs, clip_range=clip_range
+            )
+            q, s = ret
+            result[name + ".q"] = q
+            result[name + ".scale"] = s
+            meta[name] = f"gptq (int{bits})"
+            # Collect quantization error candidates for either LQER or KFEC
+            if lqer_on or getattr(h, "kfec_enabled", False):
+                W_q = q.float() * s.float().view(-1, 1)
+                E = t.float() - W_q
+                lqer_cands[name] = (E, float(E.norm()))
 
     # KFEC (Kronecker-Factored Error Correction) - more parameter-efficient than LQER
     kfec_on = bool(getattr(h, "kfec_enabled", False))
