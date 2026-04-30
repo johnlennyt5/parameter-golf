@@ -2725,7 +2725,10 @@ def deserialize(h, device):
 
 def _loss_bpb(loss_sum, token_count, byte_count):
     val_loss = (loss_sum / token_count).item()
-    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
+    if byte_count.item() > 0:
+        val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
+    else:
+        val_bpb = val_loss / math.log(2.0) * 1.3
     return val_loss, val_bpb
 
 
@@ -2783,10 +2786,11 @@ def eval_val(h, device, val_data, model, forward_logits_fn=None):
             val_token_count += float(y.numel())
             prev_ids = x
             tgt_ids = y
-            sidecar_slice = val_data.val_bytes[raw_start + 1 : raw_end].to(
-                device=device, dtype=torch.int32, non_blocking=True
-            )
-            val_byte_count += sidecar_slice.to(torch.float64).sum()
+            if val_data.val_bytes is not None:
+                sidecar_slice = val_data.val_bytes[raw_start + 1 : raw_end].to(
+                    device=device, dtype=torch.int32, non_blocking=True
+                )
+                val_byte_count += sidecar_slice.to(torch.float64).sum()
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
@@ -2889,7 +2893,10 @@ def _accumulate_bpb(
 
 def _loss_bpb_from_sums(loss_sum, token_count, byte_sum):
     val_loss = (loss_sum / token_count).item()
-    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_sum.item())
+    if byte_sum.item() > 0:
+        val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_sum.item())
+    else:
+        val_bpb = val_loss / math.log(2.0) * 1.3
     return val_loss, val_bpb
 
 
