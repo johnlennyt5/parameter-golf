@@ -96,10 +96,9 @@ Achieve **1.040-1.056 BPB** (beating SOTA by 0.005-0.020 BPB) using novel compre
 
 ---
 
-## Test Scripts
+## Run Commands
 
 ### Phase 1 Test
-**Script:** `run_phase1_test.sh`
 
 **Enabled:**
 - Gates (SMEAR + SPARSE)
@@ -111,15 +110,27 @@ Achieve **1.040-1.056 BPB** (beating SOTA by 0.005-0.020 BPB) using novel compre
 - val_bpb: 1.055-1.058
 - Time: <600s train, <600s eval
 
-**Run:**
+**Run Command:**
 ```bash
-./run_phase1_test.sh
+RUN_ID=phase1_gates_lqer_int8 \
+DATA_PATH=./data/datasets/fineweb10B_sp8192 \
+TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model \
+VOCAB_SIZE=8192 \
+CASEOPS_ENABLED=0 \
+COMPRESSOR=pergroup \
+SMEAR_GATE_ENABLED=1 \
+SPARSE_ATTN_GATE_ENABLED=1 \
+LQER_ENABLED=1 \
+LQER_TOP_K=4 \
+LQER_RANK=6 \
+GATED_ATTN_QUANT_GATE=1 \
+SEED=42 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
 
 ---
 
-### Phase 2 Test
-**Script:** `run_phase2_test.sh`
+### Phase 2 Test (MAIN TEST - Novel Techniques)
 
 **Enabled:**
 - All Phase 1 features
@@ -131,9 +142,24 @@ Achieve **1.040-1.056 BPB** (beating SOTA by 0.005-0.020 BPB) using novel compre
 - val_bpb: 1.044-1.052 (BEATS SOTA 1.0611 by 0.009-0.017!)
 - Time: <600s train, <600s eval
 
-**Run:**
+**Run Command:**
 ```bash
-./run_phase2_test.sh
+RUN_ID=phase2_novel_all \
+DATA_PATH=./data/datasets/fineweb10B_sp8192 \
+TOKENIZER_PATH=./data/tokenizers/fineweb_8192_bpe.model \
+VOCAB_SIZE=8192 \
+CASEOPS_ENABLED=0 \
+COMPRESSOR=pergroup \
+SMEAR_GATE_ENABLED=1 \
+SPARSE_ATTN_GATE_ENABLED=1 \
+LQER_ENABLED=1 \
+LQER_TOP_K=4 \
+LQER_RANK=6 \
+GATED_ATTN_QUANT_GATE=1 \
+TOKEN_FREQ_QUANT=1 \
+LQER_ADAPTIVE_RANK=1 \
+SEED=42 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
 
 ---
