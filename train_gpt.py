@@ -366,23 +366,6 @@ class Hyperparameters:
     lqer_factor_bits = int(os.environ.get("LQER_FACTOR_BITS", 4))
     lqer_asym_enabled = bool(int(os.environ.get("LQER_ASYM_ENABLED", "1")))
     lqer_asym_group = int(os.environ.get("LQER_ASYM_GROUP", "64"))
-    # Cross-Layer Parameter Sharing: Share base weights across layers with low-rank deltas.
-    # W_i = W_base + U_i @ V_i where U_i, V_i are low-rank (delta_rank).
-    # Provides massive compression: instead of num_layers full matrices, store 1 base +
-    # num_layers * 2 * delta_rank vectors. For num_layers=11, dim=512, delta_rank=32:
-    # Original: 11 * 512 * 512 = 2.8M params
-    # New: 1 * 512 * 512 + 11 * 2 * 512 * 32 = 0.26M + 0.36M = 0.62M params (78% reduction)
-    cross_layer_sharing = bool(int(os.environ.get("CROSS_LAYER_SHARING", "1")))
-    delta_rank = int(os.environ.get("DELTA_RANK", 32))
-    # Kronecker-Factored Error Correction (KFEC): Replace LQER's SVD-based low-rank
-    # correction with Kronecker product factorization. For error matrix E (n×m),
-    # approximate E ≈ (A ⊗ B) @ C where A (sqrt(n)×r), B (sqrt(n)×r), C (m×r).
-    # More parameter-efficient for large matrices than rank-only factorization.
-    kfec_enabled = bool(int(os.environ.get("KFEC_ENABLED", "1")))
-    kfec_rank = int(os.environ.get("KFEC_RANK", 8))
-    kfec_top_k = int(os.environ.get("KFEC_TOP_K", 3))
-    kfec_factor_bits = int(os.environ.get("KFEC_FACTOR_BITS", 4))
-    kfec_als_iters = int(os.environ.get("KFEC_ALS_ITERS", 10))
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -1169,29 +1152,10 @@ class GPT(nn.Module):
         head_dim = h.model_dim // h.num_heads
         kv_dim = h.num_kv_heads * head_dim
         hidden_dim = int(h.mlp_mult * h.model_dim)
-        self.cross_layer_sharing = h.cross_layer_sharing
-        if self.cross_layer_sharing:
-            # Shared base weights (1-2 matrices per type)
-            self.qo_base = nn.Parameter(torch.empty(2, h.model_dim, h.model_dim))
-            self.kv_base = nn.Parameter(torch.empty(2, kv_dim, h.model_dim))
-            self.mlp_up_base = nn.Parameter(torch.empty(hidden_dim, h.model_dim))
-            self.mlp_down_base = nn.Parameter(torch.empty(h.model_dim, hidden_dim))
-            # Low-rank deltas (per-layer): W_i = W_base + U_i @ V_i
-            self.qo_delta_U = nn.Parameter(torch.empty(2 * h.num_layers, h.model_dim, h.delta_rank))
-            self.qo_delta_V = nn.Parameter(torch.empty(2 * h.num_layers, h.delta_rank, h.model_dim))
-            self.kv_delta_U = nn.Parameter(torch.empty(2 * h.num_layers, kv_dim, h.delta_rank))
-            self.kv_delta_V = nn.Parameter(torch.empty(2 * h.num_layers, h.delta_rank, h.model_dim))
-            self.mlp_up_delta_U = nn.Parameter(torch.empty(h.num_layers, hidden_dim, h.delta_rank))
-            self.mlp_up_delta_V = nn.Parameter(torch.empty(h.num_layers, h.delta_rank, h.model_dim))
-            self.mlp_down_delta_U = nn.Parameter(torch.empty(h.num_layers, h.model_dim, h.delta_rank))
-            self.mlp_down_delta_V = nn.Parameter(torch.empty(h.num_layers, h.delta_rank, hidden_dim))
-            self.delta_rank = h.delta_rank
-        else:
-            # Original weight banks (backward compatibility)
-            self.qo_bank = nn.Parameter(torch.empty(2 * h.num_layers, h.model_dim, h.model_dim))
-            self.kv_bank = nn.Parameter(torch.empty(2 * h.num_layers, kv_dim, h.model_dim))
-            self.mlp_up_bank = nn.Parameter(torch.empty(h.num_layers, hidden_dim, h.model_dim))
-            self.mlp_down_bank = nn.Parameter(torch.empty(h.num_layers, h.model_dim, hidden_dim))
+        self.qo_bank = nn.Parameter(torch.empty(2 * h.num_layers, h.model_dim, h.model_dim))
+        self.kv_bank = nn.Parameter(torch.empty(2 * h.num_layers, kv_dim, h.model_dim))
+        self.mlp_up_bank = nn.Parameter(torch.empty(h.num_layers, hidden_dim, h.model_dim))
+        self.mlp_down_bank = nn.Parameter(torch.empty(h.num_layers, h.model_dim, hidden_dim))
         self.num_encoder_layers = h.num_layers // 2
         self.num_decoder_layers = h.num_layers - self.num_encoder_layers
         self.blocks = nn.ModuleList(
@@ -1292,38 +1256,16 @@ class GPT(nn.Module):
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         n = self.num_layers
         proj_scale = 1.0 / math.sqrt(2 * n)
-        if self.cross_layer_sharing:
-            # Initialize shared base weights
-            nn.init.orthogonal_(self.qo_base.data[0], gain=1.0)  # Q base
-            nn.init.zeros_(self.qo_base.data[1])  # O base (output projection)
-            self.qo_base.data[1].mul_(proj_scale)
-            nn.init.orthogonal_(self.kv_base.data[0], gain=1.0)  # K base
-            nn.init.orthogonal_(self.kv_base.data[1], gain=1.0)  # V base
-            nn.init.orthogonal_(self.mlp_up_base.data, gain=1.0)
-            nn.init.zeros_(self.mlp_down_base.data)
-            self.mlp_down_base.data.mul_(proj_scale)
-            # Initialize low-rank deltas with small random values
-            delta_std = 0.02 / math.sqrt(self.delta_rank)
-            nn.init.normal_(self.qo_delta_U.data, mean=0.0, std=delta_std)
-            nn.init.normal_(self.qo_delta_V.data, mean=0.0, std=delta_std)
-            nn.init.normal_(self.kv_delta_U.data, mean=0.0, std=delta_std)
-            nn.init.normal_(self.kv_delta_V.data, mean=0.0, std=delta_std)
-            nn.init.normal_(self.mlp_up_delta_U.data, mean=0.0, std=delta_std)
-            nn.init.normal_(self.mlp_up_delta_V.data, mean=0.0, std=delta_std)
-            nn.init.normal_(self.mlp_down_delta_U.data, mean=0.0, std=delta_std)
-            nn.init.normal_(self.mlp_down_delta_V.data, mean=0.0, std=delta_std)
-        else:
-            # Original initialization (backward compatibility)
-            for i in range(n):
-                nn.init.orthogonal_(self.qo_bank.data[i], gain=1.0)
-                nn.init.zeros_(self.qo_bank.data[n + i])
-                self.qo_bank.data[n + i].mul_(proj_scale)
-                nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)
-                nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)
-            for i in range(n):
-                nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)
-                nn.init.zeros_(self.mlp_down_bank.data[i])
-                self.mlp_down_bank.data[i].mul_(proj_scale)
+        for i in range(n):
+            nn.init.orthogonal_(self.qo_bank.data[i], gain=1.0)
+            nn.init.zeros_(self.qo_bank.data[n + i])
+            self.qo_bank.data[n + i].mul_(proj_scale)
+            nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)
+            nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)
+        for i in range(n):
+            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)
+            nn.init.zeros_(self.mlp_down_bank.data[i])
+            self.mlp_down_bank.data[i].mul_(proj_scale)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
                 if getattr(module, "_zero_init", False):
@@ -1337,25 +1279,14 @@ class GPT(nn.Module):
 
     def _bank_weights(self, i):
         n = self.num_layers
-        if self.cross_layer_sharing:
-            # Compute weights as W_i = W_base + U_i @ V_i (low-rank delta)
-            q_w = self.qo_base[0] + torch.matmul(self.qo_delta_U[i], self.qo_delta_V[i])
-            k_w = self.kv_base[0] + torch.matmul(self.kv_delta_U[i], self.kv_delta_V[i])
-            v_w = self.kv_base[1] + torch.matmul(self.kv_delta_U[n + i], self.kv_delta_V[n + i])
-            o_w = self.qo_base[1] + torch.matmul(self.qo_delta_U[n + i], self.qo_delta_V[n + i])
-            up_w = self.mlp_up_base + torch.matmul(self.mlp_up_delta_U[i], self.mlp_up_delta_V[i])
-            down_w = self.mlp_down_base + torch.matmul(self.mlp_down_delta_U[i], self.mlp_down_delta_V[i])
-            return q_w, k_w, v_w, o_w, up_w, down_w
-        else:
-            # Original weight bank lookup (backward compatibility)
-            return (
-                self.qo_bank[i],
-                self.kv_bank[i],
-                self.kv_bank[n + i],
-                self.qo_bank[n + i],
-                self.mlp_up_bank[i],
-                self.mlp_down_bank[i],
-            )
+        return (
+            self.qo_bank[i],
+            self.kv_bank[i],
+            self.kv_bank[n + i],
+            self.qo_bank[n + i],
+            self.mlp_up_bank[i],
+            self.mlp_down_bank[i],
+        )
 
     def _parallel_block(
         self, block_idx, lane0, lane1, x0,
@@ -1968,31 +1899,12 @@ PACKED_REPLICATED_GRAD_MAX_NUMEL = 1 << 15
 
 class Optimizers:
     def __init__(self, h, base_model):
-        # Handle cross-layer sharing vs original weight banks
-        if hasattr(base_model, 'cross_layer_sharing') and base_model.cross_layer_sharing:
-            # Cross-layer sharing: use base weights + deltas
-            matrix_params = [
-                base_model.qo_base,
-                base_model.kv_base,
-                base_model.mlp_up_base,
-                base_model.mlp_down_base,
-                base_model.qo_delta_U,
-                base_model.qo_delta_V,
-                base_model.kv_delta_U,
-                base_model.kv_delta_V,
-                base_model.mlp_up_delta_U,
-                base_model.mlp_up_delta_V,
-                base_model.mlp_down_delta_U,
-                base_model.mlp_down_delta_V,
-            ]
-        else:
-            # Original weight banks
-            matrix_params = [
-                base_model.qo_bank,
-                base_model.kv_bank,
-                base_model.mlp_up_bank,
-                base_model.mlp_down_bank,
-            ]
+        matrix_params = [
+            base_model.qo_bank,
+            base_model.kv_bank,
+            base_model.mlp_up_bank,
+            base_model.mlp_down_bank,
+        ]
         block_named_params = list(base_model.blocks.named_parameters())
         scalar_params = [
             p
@@ -2117,25 +2029,11 @@ def restore_fp32_params(model):
             or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ) and param.dtype != torch.float32:
             param.data = param.data.float()
-    # Handle cross-layer sharing parameters
-    if hasattr(model, "cross_layer_sharing") and model.cross_layer_sharing:
-        model.qo_base.data = model.qo_base.data.float()
-        model.kv_base.data = model.kv_base.data.float()
-        model.mlp_up_base.data = model.mlp_up_base.data.float()
-        model.mlp_down_base.data = model.mlp_down_base.data.float()
-        model.qo_delta_U.data = model.qo_delta_U.data.float()
-        model.qo_delta_V.data = model.qo_delta_V.data.float()
-        model.kv_delta_U.data = model.kv_delta_U.data.float()
-        model.kv_delta_V.data = model.kv_delta_V.data.float()
-        model.mlp_up_delta_U.data = model.mlp_up_delta_U.data.float()
-        model.mlp_up_delta_V.data = model.mlp_up_delta_V.data.float()
-        model.mlp_down_delta_U.data = model.mlp_down_delta_U.data.float()
-        model.mlp_down_delta_V.data = model.mlp_down_delta_V.data.float()
-    elif hasattr(model, "qo_bank") and model.qo_bank is not None:
+    if hasattr(model, "qo_bank") and model.qo_bank is not None:
         model.qo_bank.data = model.qo_bank.data.float()
         model.kv_bank.data = model.kv_bank.data.float()
-        model.mlp_up_bank.data = model.mlp_up_bank.data.float()
-        model.mlp_down_bank.data = model.mlp_down_bank.data.float()
+    model.mlp_up_bank.data = model.mlp_up_bank.data.float()
+    model.mlp_down_bank.data = model.mlp_down_bank.data.float()
 
 
 def collect_hessians(model, train_loader, h, device, n_calibration_batches=64):
@@ -2319,98 +2217,6 @@ def _lqer_pack_asym(A, B, g=64):
     return qA, sA, qB, sB
 
 
-def _kronecker_factorize(E, rank, als_iters=10):
-    """
-    Kronecker-Factored Error Correction (KFEC): Approximate error matrix E (n×m)
-    using Kronecker product factorization: E ≈ (A ⊗ B) @ C.
-
-    For an error matrix E of shape (n, m), we find:
-    - A: (n_A, rank) where n_A = ceil(sqrt(n))
-    - B: (n_B, rank) where n_B = ceil(n / n_A)
-    - C: (m, rank)
-
-    Such that E ≈ kron(A, B) @ C^T = (A ⊗ B) @ C^T
-
-    This is more parameter-efficient than SVD-based low-rank for large matrices:
-    - SVD stores: n*rank + m*rank parameters
-    - KFEC stores: n_A*rank + n_B*rank + m*rank parameters
-    - Savings: When n = n_A * n_B, KFEC uses ~2*sqrt(n)*rank vs n*rank for SVD
-
-    Uses Alternating Least Squares (ALS) to optimize the factorization.
-    """
-    n, m = E.shape
-    device = E.device
-
-    # Find optimal factorization of n (closest to sqrt for balanced factors)
-    n_A = int(np.sqrt(n))
-    while n % n_A != 0 and n_A > 1:
-        n_A -= 1
-    if n_A == 1:  # n is prime or too small, fall back to closest factor
-        n_A = max(2, int(np.sqrt(n)))
-    n_B = (n + n_A - 1) // n_A  # ceiling division
-
-    # Pad E if needed to make it divisible
-    if n % n_A != 0:
-        pad_rows = n_A * n_B - n
-        E_padded = torch.cat([E, torch.zeros(pad_rows, m, device=device)], dim=0)
-        n_padded = n_A * n_B
-    else:
-        E_padded = E
-        n_padded = n
-
-    # Reshape to 3D tensor: (n_A, n_B, m)
-    E_3d = E_padded.reshape(n_A, n_B, m)
-
-    # Initialize factors with small random values
-    A = torch.randn(n_A, rank, device=device) * 0.01
-    B = torch.randn(n_B, rank, device=device) * 0.01
-    C = torch.randn(m, rank, device=device) * 0.01
-
-    # Simplified Alternating Least Squares optimization
-    # Optimize: E_padded ≈ kron(A, B) @ C^T
-    for _ in range(als_iters):
-        # Update C (fix A, B) - most straightforward
-        kron_AB = torch.kron(A, B)  # (n_padded, rank)
-        # Solve C: E_padded ≈ kron_AB @ C^T  =>  E_padded^T ≈ C @ kron_AB^T
-        # Use lstsq: C = (kron_AB^T @ kron_AB)^-1 @ kron_AB^T @ E_padded
-        try:
-            C = torch.linalg.lstsq(kron_AB, E_padded).solution.T  # (m, rank)
-        except:
-            # Fallback if lstsq fails
-            C = (torch.pinverse(kron_AB) @ E_padded).T
-
-        # Update A and B jointly using gradients (simple approach)
-        # Compute residual: R = E_padded - kron(A, B) @ C^T
-        reconstruction = kron_AB @ C.T
-        residual = E_padded - reconstruction
-
-        # Simple gradient step for A and B
-        lr = 0.01
-        # Gradient for A: reshape residual and compute contribution
-        grad_kron = residual @ C  # (n_padded, rank)
-        # Split gradient into A and B components
-        grad_kron_3d = grad_kron.reshape(n_A, n_B, rank)
-        grad_A = grad_kron_3d.sum(dim=1)  # (n_A, rank)
-        grad_B = grad_kron_3d.sum(dim=0)  # (n_B, rank)
-
-        A = A + lr * grad_A
-        B = B + lr * grad_B
-
-    return A, B, C, n_A, n_B
-
-
-def _kfec_pack(A, B, C, bits):
-    """Pack KFEC factors A, B, C with quantization."""
-    rng = 2 ** (bits - 1) - 1
-    sA = (A.abs().amax(dim=1).clamp_min(1e-10) / rng).to(torch.float16)
-    sB = (B.abs().amax(dim=1).clamp_min(1e-10) / rng).to(torch.float16)
-    sC = (C.abs().amax(dim=1).clamp_min(1e-10) / rng).to(torch.float16)
-    qA = torch.clamp(torch.round(A / sA.float().view(-1, 1)), -rng, rng).to(torch.int8)
-    qB = torch.clamp(torch.round(B / sB.float().view(-1, 1)), -rng, rng).to(torch.int8)
-    qC = torch.clamp(torch.round(C / sC.float().view(-1, 1)), -rng, rng).to(torch.int8)
-    return qA, sA, qB, sB, qC, sC
-
-
 def gptq_mixed_quantize(state_dict, hessians, h):
     result = {}
     meta = {}
@@ -2452,55 +2258,18 @@ def gptq_mixed_quantize(state_dict, hessians, h):
             cs = h.matrix_clip_sigmas
         bits = h.embed_bits if "tok_emb" in name else h.matrix_bits
         clip_range = 2 ** (bits - 1) - 1
-
-        # For cross-layer sharing parameters, use simple quantization (no GPTQ Hessian)
-        # since we don't have Hessians collected for base/delta parameters
-        if name not in hessians:
-            # Simple min-max quantization without GPTQ
-            t_abs = t.abs()
-            t_max = t_abs.max(dim=1, keepdim=True)[0]
-            scale = t_max / clip_range
-            scale = scale.clamp(min=1e-8)
-            q = (t / scale).round().clamp(-clip_range, clip_range).to(torch.int8)
-            s = scale.squeeze(1).to(torch.float16)
-            result[name + ".q"] = q
-            result[name + ".scale"] = s
-            meta[name] = f"simple (int{bits})"
-        else:
-            # GPTQ quantization with Hessian
-            ret = gptq_quantize_weight(
-                t, hessians[name], clip_sigmas=cs, clip_range=clip_range
-            )
-            q, s = ret
-            result[name + ".q"] = q
-            result[name + ".scale"] = s
-            meta[name] = f"gptq (int{bits})"
-            # Collect quantization error candidates for either LQER or KFEC
-            if lqer_on or getattr(h, "kfec_enabled", False):
-                W_q = q.float() * s.float().view(-1, 1)
-                E = t.float() - W_q
-                lqer_cands[name] = (E, float(E.norm()))
-
-    # KFEC (Kronecker-Factored Error Correction) - more parameter-efficient than LQER
-    kfec_on = bool(getattr(h, "kfec_enabled", False))
-    if kfec_on and lqer_cands:
-        top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[: h.kfec_top_k]
-        for (name, (E, _)) in top:
-            # Kronecker factorization: E ≈ (A ⊗ B) @ C^T
-            A, B, C, n_A, n_B = _kronecker_factorize(
-                E, h.kfec_rank, als_iters=h.kfec_als_iters
-            )
-            qA, sA, qB, sB, qC, sC = _kfec_pack(A, B, C, h.kfec_factor_bits)
-            result[name + ".kfA"] = qA
-            result[name + ".kfAs"] = sA
-            result[name + ".kfB"] = qB
-            result[name + ".kfBs"] = sB
-            result[name + ".kfC"] = qC
-            result[name + ".kfCs"] = sC
-            result[name + ".kf_nA"] = torch.tensor(n_A, dtype=torch.int32)
-            result[name + ".kf_nB"] = torch.tensor(n_B, dtype=torch.int32)
-            meta[name] = meta[name] + "+kfec"
-    elif lqer_on and lqer_cands:
+        ret = gptq_quantize_weight(
+            t, hessians[name], clip_sigmas=cs, clip_range=clip_range
+        )
+        q, s = ret
+        result[name + ".q"] = q
+        result[name + ".scale"] = s
+        meta[name] = f"gptq (int{bits})"
+        if lqer_on:
+            W_q = q.float() * s.float().view(-1, 1)
+            E = t.float() - W_q
+            lqer_cands[name] = (E, float(E.norm()))
+    if lqer_on and lqer_cands:
         top = sorted(lqer_cands.items(), key=lambda kv: -kv[1][1])[: h.lqer_top_k]
         asym_on = bool(getattr(h, "lqer_asym_enabled", False))
         asym_g = int(getattr(h, "lqer_asym_group", 64))
@@ -2558,21 +2327,7 @@ def dequantize_mixed(result, meta, template_sd):
             W = q.float() * s.float().view(q.shape[0], *[1] * (q.ndim - 1))
         else:
             W = q.float() * float(s.item())
-        if "kfec" in info:
-            # KFEC dequantization: E ≈ (A ⊗ B) @ C^T
-            qA = result[name + ".kfA"].float() * result[name + ".kfAs"].float().view(-1, 1)
-            qB = result[name + ".kfB"].float() * result[name + ".kfBs"].float().view(-1, 1)
-            qC = result[name + ".kfC"].float() * result[name + ".kfCs"].float().view(-1, 1)
-            n_A = int(result[name + ".kf_nA"].item())
-            n_B = int(result[name + ".kf_nB"].item())
-            # Reconstruct error: E = (A ⊗ B) @ C^T
-            kron_AB = torch.kron(qA, qB)  # (n_A * n_B, rank)
-            E_padded = kron_AB @ qC.T  # (n_A * n_B, m)
-            # Remove padding if it was added
-            n_orig = W.shape[0]
-            E = E_padded[:n_orig, :]
-            W = W + E
-        elif "lqer_asym" in info:
+        if "lqer_asym" in info:
             qA_t = result[name + ".lqA_a"]
             sA_t = result[name + ".lqAs_a"]
             qB_t = result[name + ".lqB_a"]
@@ -2970,12 +2725,7 @@ def deserialize(h, device):
 
 def _loss_bpb(loss_sum, token_count, byte_count):
     val_loss = (loss_sum / token_count).item()
-    # Handle case when byte_count is 0 (CASEOPS_ENABLED=0)
-    if byte_count.item() > 0:
-        val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
-    else:
-        # Fallback: assume ~1.3 bytes per token for sp8192 tokenizer
-        val_bpb = val_loss / math.log(2.0) * 1.3
+    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
     return val_loss, val_bpb
 
 
@@ -3033,12 +2783,10 @@ def eval_val(h, device, val_data, model, forward_logits_fn=None):
             val_token_count += float(y.numel())
             prev_ids = x
             tgt_ids = y
-            # Only use byte sidecar if CaseOps is enabled
-            if val_data.val_bytes is not None:
-                sidecar_slice = val_data.val_bytes[raw_start + 1 : raw_end].to(
-                    device=device, dtype=torch.int32, non_blocking=True
-                )
-                val_byte_count += sidecar_slice.to(torch.float64).sum()
+            sidecar_slice = val_data.val_bytes[raw_start + 1 : raw_end].to(
+                device=device, dtype=torch.int32, non_blocking=True
+            )
+            val_byte_count += sidecar_slice.to(torch.float64).sum()
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
@@ -3141,12 +2889,7 @@ def _accumulate_bpb(
 
 def _loss_bpb_from_sums(loss_sum, token_count, byte_sum):
     val_loss = (loss_sum / token_count).item()
-    # Handle case when byte_sum is 0 (CASEOPS_ENABLED=0)
-    if byte_sum.item() > 0:
-        val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_sum.item())
-    else:
-        # Fallback: assume ~1.3 bytes per token for sp8192 tokenizer
-        val_bpb = val_loss / math.log(2.0) * 1.3
+    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_sum.item())
     return val_loss, val_bpb
 
 
