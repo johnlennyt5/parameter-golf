@@ -2954,7 +2954,12 @@ def deserialize(h, device):
 
 def _loss_bpb(loss_sum, token_count, byte_count):
     val_loss = (loss_sum / token_count).item()
-    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
+    # Handle case when byte_count is 0 (CASEOPS_ENABLED=0)
+    if byte_count.item() > 0:
+        val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
+    else:
+        # Fallback: assume ~1.3 bytes per token for sp8192 tokenizer
+        val_bpb = val_loss / math.log(2.0) * 1.3
     return val_loss, val_bpb
 
 
@@ -3120,7 +3125,12 @@ def _accumulate_bpb(
 
 def _loss_bpb_from_sums(loss_sum, token_count, byte_sum):
     val_loss = (loss_sum / token_count).item()
-    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_sum.item())
+    # Handle case when byte_sum is 0 (CASEOPS_ENABLED=0)
+    if byte_sum.item() > 0:
+        val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_sum.item())
+    else:
+        # Fallback: assume ~1.3 bytes per token for sp8192 tokenizer
+        val_bpb = val_loss / math.log(2.0) * 1.3
     return val_loss, val_bpb
 
 
